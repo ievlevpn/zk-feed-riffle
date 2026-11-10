@@ -1,0 +1,21 @@
+{
+  "id": "feed-riffle",
+  "name": "Feed Riffle",
+  "version": "0.1.0",
+  "api": 0,
+  "minApp": "0.4.0",
+  "author": "Pavel Ievlev",
+  "description": "Clear an RSS backlog one card at a time: discard, keep (filed, tagged, with a note) or skip. Swipe left to discard, right to keep.",
+  "main": "main.js",
+  "permissions": [
+    "library:read",
+    "notes:read",
+    "net:*",
+    "zotero:create-items",
+    "zotero:collections",
+    "zotero:tags",
+    "zotero:notes",
+    "zotero:remove",
+    "background"
+  ]
+}
