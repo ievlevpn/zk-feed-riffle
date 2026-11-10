@@ -21,19 +21,20 @@
 //                   changed; the plugin never draws, animates or picks an e-ink refresh.
 //   5. Feeds        RSS 2.0, RSS 1.0 and Atom, parsed with txml (bundled into main.js).
 //
-// On the Kindle there is no Zotero feed reader, so the plugin reads the feeds itself, from
-// settings.json.
+// On the Kindle there is no Zotero feed reader, so the plugin reads the feeds itself: the ones
+// you subscribe to in Zotero (synced, zk.library.feeds), or the ones settings.json lists.
 
 import { filter, isElementNode, parse, type TNode } from "txml/txml";
 
 // ───────────────────────────── Settings ─────────────────────────────
 
-// settings.json, next to plugin.json, edited over USB:
+// settings.json, next to plugin.json, edited over USB (optional):
 //   { "feeds": ["https://rss.arxiv.org/rss/math.PR", "https://…/atom.xml"], "tags": ["riffled"] }
+// Without "feeds", the plugin riffles your Zotero feeds.
 declare global {
   namespace zk {
     interface Settings {
-      /** RSS or Atom feed addresses. */
+      /** RSS or Atom feed addresses; without them, your Zotero feeds. */
       feeds?: string[];
       /** Tags every kept item gets, besides the ones chosen when keeping it. */
       tags?: string[];
@@ -80,11 +81,13 @@ interface State {
   current: string | null;
   /** Cards added by the background since the deck was last opened: the badge. */
   fresh: number;
+  /** Feed address → when it was last fetched (ms): the oldest goes first. */
+  fetchedAt: Record<string, number>;
 }
 
 const LIMITS = { seen: 5000, undo: 50, recent: 6 };
 
-const empty = (): State => ({ deck: [], seen: [], undo: [], recent: [], titles: {}, current: null, fresh: 0 });
+const empty = (): State => ({ deck: [], seen: [], undo: [], recent: [], titles: {}, current: null, fresh: 0, fetchedAt: {} });
 
 async function load(): Promise<State> {
   return { ...empty(), ...(await zk.storage.get<State>("state")) };
@@ -119,15 +122,31 @@ function takeCard(s: State, id?: string): Card | undefined {
   return at < 0 ? undefined : s.deck.splice(at, 1)[0];
 }
 
+/** Feed address → the name you gave it in Zotero (filled by feedList). */
+let zoteroNames: Record<string, string> = {};
+
+/** The feeds to riffle: settings.json's, if it lists any; else the ones you follow in Zotero. */
+async function feedList(): Promise<string[]> {
+  const own = zk.settings.feeds ?? [];
+  if (own.length) return own;
+  const feeds = await zk.library.feeds();
+  zoteroNames = Object.fromEntries(feeds.map((f) => [f.url, f.name]));
+  return feeds.map((f) => f.url);
+}
+
+function hostOf(feed: string): string {
+  return URL.canParse(feed) ? new URL(feed).hostname : feed;
+}
+
 function feedName(s: State, feed: string | null): string {
   if (!feed) return "All feeds";
-  return s.titles[feed] ?? (URL.canParse(feed) ? new URL(feed).hostname : feed);
+  return zoteroNames[feed] ?? s.titles[feed] ?? hostOf(feed);
 }
 
 // ───────────────────────────── 2. Background: fetch, parse, dedupe ─────────────────────────────
 
-// After a sync, at most hourly, with 30 seconds in all: fetch each feed (8 s at most each, so
-// one slow host can't eat the run), parse it, drop what is already dealt or decided, mark what
+// After a sync, at most hourly, with 30 seconds in all: fetch the feeds, longest-unfetched first
+// (8 s at most each, so one slow host can't eat the run), parse each, drop what is already dealt or decided, mark what
 // is already in the library, and add the rest to the deck. The badge counts what is new since
 // the deck was last opened; zk.ui.refresh() redraws the deck if the user is riffling right now.
 zk.background(async () => {
@@ -139,18 +158,25 @@ zk.background(async () => {
   zk.ui.refresh();
 });
 
-/** Fetches every feed and adds its new cards to the deck. Resolves how many were added. */
+/**
+ * Fetches every feed and adds its new cards to the deck. Resolves how many were added. The feed
+ * fetched longest ago goes first, and each feed's cards are saved as soon as it is read: a run cut
+ * short by its time limit keeps what it found, and the next run starts where it stopped.
+ */
 async function refreshFeeds(): Promise<number> {
+  const feeds = await feedList();
   const before = await load(); // a snapshot is enough here: the merge below checks again
   const known = new Set([...before.seen, ...before.deck.map((c) => c.id)]);
-  const fresh: Card[] = [];
-  const titles: Record<string, string> = {};
-  for (const url of zk.settings.feeds ?? []) {
+  feeds.sort((a, b) => (before.fetchedAt[a] ?? 0) - (before.fetchedAt[b] ?? 0));
+  let added = 0;
+  for (const url of feeds) {
+    const fresh: Card[] = [];
+    let title: string | null = null;
     try {
       const res = await zk.fetch(url, { timeout: 8000 });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const feed = parseFeed(await res.text(), url);
-      if (feed.title) titles[url] = feed.title;
+      title = feed.title || null;
       for (const card of feed.cards) {
         if (known.has(card.id)) continue;
         known.add(card.id);
@@ -159,17 +185,18 @@ async function refreshFeeds(): Promise<number> {
       }
     } catch (e) {
       // One bad feed shouldn't stop the others. (A LimitError "time" — the whole run's 30 s —
-      // can't be caught: it ends the run, and the next run starts over.)
+      // can't be caught: it ends the run; what was saved stays, and the next run goes on.)
       console.warn("skipped feed", url, String(e));
     }
+    added += await withState((s) => {
+      const dealt = new Set([...s.seen, ...s.deck.map((c) => c.id)]); // the user may have decided meanwhile
+      const add = fresh.filter((c) => !dealt.has(c.id));
+      s.deck.push(...add);
+      if (title) s.titles[url] = title;
+      s.fetchedAt[url] = Date.now();
+      return add.length;
+    });
   }
-  const added = await withState((s) => {
-    const dealt = new Set([...s.seen, ...s.deck.map((c) => c.id)]); // the user may have decided meanwhile
-    const add = fresh.filter((c) => !dealt.has(c.id));
-    s.deck.push(...add);
-    Object.assign(s.titles, titles);
-    return add.length;
-  });
   console.log(`${added} new cards`);
   return added;
 }
@@ -332,6 +359,7 @@ zk.screen("deck", {
   title: "Feed Riffle",
   main: true,
   render: async () => {
+    followed = await feedList(); // and the names you gave them in Zotero
     const s = await load();
     const cards = cardsIn(s);
     const top = cards[0];
@@ -469,7 +497,10 @@ function summary(s: State): zk.ui.Child[] {
 
 zk.screen("summary", {
   title: "The sitting",
-  render: async () => zk.ui.column(summary(await load())),
+  render: async () => {
+    followed = await feedList();
+    return zk.ui.column(summary(await load()));
+  },
   onEvent: async (e) => {
     if (e.kind === "select") zk.ui.close(await switchFeed(e.row));
   },
@@ -477,8 +508,11 @@ zk.screen("summary", {
 
 // ── Feeds: switch deck, or fetch now ──
 
+/** Each feed — those you follow, then any that still has cards — with its card count. */
+let followed: string[] = [];
+
 function feedCounts(s: State): { feed: string; count: number }[] {
-  const feeds = [...new Set([...(zk.settings.feeds ?? []), ...s.deck.map((c) => c.feed)])];
+  const feeds = [...new Set([...followed, ...s.deck.map((c) => c.feed)])];
   return feeds.map((feed) => ({ feed, count: s.deck.filter((c) => c.feed === feed).length }));
 }
 
@@ -496,13 +530,14 @@ let fetched: string | null = null;
 zk.screen("feeds", {
   title: "Feeds",
   render: async () => {
+    followed = await feedList();
     const s = await load();
     const rows: zk.ui.ListRow[] = [
       { id: "*", title: "All feeds", meta: `${s.deck.length}`, selected: s.current === null },
       ...feedCounts(s).map(({ feed, count }) => ({
         id: feed,
         title: feedName(s, feed),
-        subtitle: feed,
+        subtitle: hostOf(feed),
         meta: `${count}`,
         selected: s.current === feed,
       })),

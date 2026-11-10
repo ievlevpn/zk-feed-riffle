@@ -7,9 +7,9 @@ workaround, the API is wrong — and commented as a walk-through of plugin scree
 
 ## Install
 
-On the Kindle (Zotero for Kindle 0.5.0 or later): *Settings → Plugins → Get plugins → Feed Riffle →
-Install*, then turn it on. Put your feeds in `settings.json` (below) over USB, in
-`zotero/plugins/feed-riffle/`. Updates keep it.
+On the Kindle (Zotero for Kindle 0.6.0 or later): *Settings → Plugins → Get plugins → Feed Riffle →
+Install*, then turn it on. It riffles the feeds you follow in Zotero (*New Feed* in Zotero's
+desktop app; they sync to the Kindle with your library), under the names you gave them there.
 
 ## Use
 
@@ -44,7 +44,8 @@ card*; a gap over five minutes isn't counted) and the feeds that still have card
 ## What it does
 
 - **Fetches feeds itself.** Zotero's feed reader isn't on the Kindle, so the background task
-  (after a sync, at most hourly) fetches each feed in `settings.json`, parses RSS 2.0, RSS 1.0 or
+  (after a sync, at most hourly) fetches each of your Zotero feeds (or those in `settings.json`),
+  the one fetched longest ago first, saving each feed's cards as soon as it is read. It parses RSS 2.0, RSS 1.0 or
   Atom, and adds new entries to a deck kept in the plugin's storage; the badge says how many are
   new. It parses with [txml](https://www.npmjs.com/package/txml) 6.0.3 (pinned; no dependencies,
   no Node or DOM APIs), bundled into `main.js`.
@@ -54,7 +55,7 @@ card*; a gap over five minutes isn't counted) and the feeds that still have card
 | Permission | Why |
 |---|---|
 | `net:*` | feeds can be on any host (arXiv, journals, blogs) |
-| `library:read` | find items by DOI or arXiv id; list collections |
+| `library:read` | your Zotero feeds; find items by DOI or arXiv id; list collections |
 | `notes:read` | read the old item's notes, to copy them when replacing it |
 | `zotero:create-items` | create the kept item |
 | `zotero:collections` | file it into a collection |
@@ -65,7 +66,7 @@ card*; a gap over five minutes isn't counted) and the feeds that still have card
 
 ## Settings
 
-`settings.json`, next to `plugin.json`:
+Optional: `settings.json`, next to `plugin.json` (updates keep it):
 
 ```json
 {
@@ -74,7 +75,7 @@ card*; a gap over five minutes isn't counted) and the feeds that still have card
 }
 ```
 
-- `feeds` — RSS or Atom addresses.
+- `feeds` — RSS or Atom addresses, instead of your Zotero feeds.
 - `tags` — added to every kept item, besides those chosen when keeping it.
 
 ## Build

@@ -519,6 +519,17 @@ declare namespace zk {
     function collections(): Promise<Collection[]>;
 
     /**
+     * The user's Zotero feed subscriptions, as of the last sync, sorted by name. Read-only: the
+     * app never changes them. Needs app 0.6.0.
+     *
+     * **Permission**: `library:read`.
+     *
+     * @example
+     * const arxiv = (await zk.library.feeds()).filter((f) => f.url.startsWith("https://rss.arxiv.org/"));
+     */
+    function feeds(): Promise<Feed[]>;
+
+    /**
      * All tags in the library, by name.
      *
      * **Permission**: `library:read`.
@@ -1596,6 +1607,13 @@ declare namespace zk {
     parent: string | null;
     /** Names from the top level down, ending with its own: `["Reading", "arXiv"]`. */
     path: string[];
+  }
+
+  /** A Zotero feed subscription. */
+  interface Feed {
+    url: string;
+    /** Its name in Zotero; the URL if it has none. */
+    name: string;
   }
 
   /** A tag in the library. */
