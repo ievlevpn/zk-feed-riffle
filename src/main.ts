@@ -10,8 +10,9 @@
 //
 // Read this file top to bottom: it is a walk-through of plugin screens. The pieces:
 //
-//   1. State        the deck and its history, in zk.storage, changed only through
-//                   zk.storage.update (a background refresh can run while the user riffles).
+//   1. State        the history in one zk.storage key, each feed's cards in a key of its own,
+//                   changed only through zk.storage.update (a background refresh can run
+//                   while the user riffles).
 //   2. Background   after a sync, at most hourly: fetch the feeds, parse, mark "in library",
 //                   add new cards; a badge "N new" on the Plugins icon; zk.ui.refresh().
 //   3. Verdicts     discard, skip, keep, replaceOld, undo: plain async functions on the state.
@@ -67,9 +68,14 @@ type Step =
   | { kind: "discard" | "skip"; card: Card }
   | { kind: "keep"; card: Card; itemKey: string; changes: { kind: "createItem" | "trash"; key: string; changeId: string }[] };
 
+// Storage holds one small key for the state ("state") and one key per feed for its undecided
+// cards ("deck:" + a hash of the feed's address). zk.storage takes at most 1 MB a value and 16 MB
+// in all, and a backlog of 34 feeds with abstracts is more than 1 MB: one key for everything
+// stopped being saved. Each key is updated on its own (an update can't write another key), so
+// a verdict writes in an order a crash can't undo: the card's id goes into `seen` first, then
+// the card leaves its deck — and load() drops any deck card whose id is in `seen`.
+
 interface State {
-  /** Every card not decided yet, all feeds, in dealing order. */
-  deck: Card[];
   /** Ids of cards decided (discarded or kept), so a refresh doesn't deal them again. */
   seen: string[];
   undo: Step[];
@@ -83,14 +89,69 @@ interface State {
   fresh: number;
   /** Feed address → when it was last fetched (ms): the oldest goes first. */
   fetchedAt: Record<string, number>;
+  /** The card Undo brought back: dealt first, whichever feed it is in. */
+  top: string | null;
 }
 
-const LIMITS = { seen: 5000, undo: 50, recent: 6 };
+/** A feed's undecided cards, in dealing order, under `deck:<hash of the feed>`. */
+interface Deck {
+  feed: string;
+  cards: Card[];
+}
 
-const empty = (): State => ({ deck: [], seen: [], undo: [], recent: [], titles: {}, current: null, fresh: 0, fetchedAt: {} });
+/** The state and every feed's undecided cards (feed → cards): what the screens show. */
+interface View {
+  s: State;
+  decks: Map<string, Card[]>;
+}
 
-async function load(): Promise<State> {
-  return { ...empty(), ...(await zk.storage.get<State>("state")) };
+const LIMITS = {
+  seen: 5000,
+  undo: 50,
+  recent: 6,
+  /** Undecided cards a feed keeps; over that, its oldest are dropped (not marked seen). */
+  cards: 150,
+  /** A card's title, summary and authors, as stored. */
+  title: 500,
+  summary: 1500,
+  authors: 100,
+  /** A feed's deck, in bytes — and all decks together (zk.storage: 1 MB a value, 16 MB in all). */
+  deckBytes: 400_000,
+  allBytes: 12_000_000,
+};
+
+const STATE = "state";
+const DECK = "deck:";
+
+const empty = (): State => ({ seen: [], undo: [], recent: [], titles: {}, current: null, fresh: 0, fetchedAt: {}, top: null });
+
+function deckKey(feed: string): string {
+  return DECK + hash(feed);
+}
+
+/** Reads the state and the decks, decided cards left out. */
+async function load(): Promise<View> {
+  await migrated();
+  // Decks first, then the state: a verdict writes `seen` before the deck, so a card decided
+  // between the two reads is either gone from its deck or already in `seen`.
+  const decks = await readDecks();
+  const s: State = { ...empty(), ...(await zk.storage.get<State>(STATE)) };
+  return { s, decks: undecided(decks, s) };
+}
+
+async function readDecks(): Promise<Map<string, Card[]>> {
+  const decks = new Map<string, Card[]>();
+  const keys = (await zk.storage.keys()).filter((k) => k.startsWith(DECK)).sort();
+  for (const key of keys) {
+    const d = await zk.storage.get<Deck>(key);
+    if (d?.feed && d.cards?.length) decks.set(d.feed, d.cards);
+  }
+  return decks;
+}
+
+function undecided(decks: Map<string, Card[]>, s: State): Map<string, Card[]> {
+  const seen = new Set(s.seen);
+  return new Map([...decks].map(([feed, cards]) => [feed, cards.filter((c) => !seen.has(c.id))]));
 }
 
 /**
@@ -100,8 +161,9 @@ async function load(): Promise<State> {
  * network, the user's confirmation — is done outside it, so it doesn't hold up the next update.
  */
 async function withState<T>(change: (state: State) => T | Promise<T>): Promise<T> {
+  await migrated();
   let result!: T;
-  await zk.storage.update<State>("state", async (old) => {
+  await zk.storage.update<State>(STATE, async (old) => {
     const state = { ...empty(), ...old };
     result = await change(state);
     state.seen = state.seen.slice(-LIMITS.seen);
@@ -111,27 +173,154 @@ async function withState<T>(change: (state: State) => T | Promise<T>): Promise<T
   return result;
 }
 
-/** The cards of the feed being riffled, in order. */
-function cardsIn(s: State): Card[] {
-  return s.current ? s.deck.filter((c) => c.feed === s.current) : s.deck;
+/** Changes `feed`'s deck, as one step; an empty deck is deleted. */
+async function withDeck(feed: string, change: (cards: Card[]) => Card[] | Promise<Card[]>): Promise<void> {
+  await zk.storage.update<Deck>(deckKey(feed), async (old) => {
+    const cards = await change(old?.feed === feed ? old.cards : []);
+    return cards.length ? { feed, cards } : undefined;
+  });
 }
 
-/** Takes card `id` (default: the top card of the feed being riffled) out of the deck. */
-function takeCard(s: State, id?: string): Card | undefined {
-  const at = id ? s.deck.findIndex((c) => c.id === id) : s.deck.findIndex((c) => !s.current || c.feed === s.current);
-  return at < 0 ? undefined : s.deck.splice(at, 1)[0];
+/** Inside a state update: the view, with that state. (Reading other keys there is allowed.) */
+async function viewOf(s: State): Promise<View> {
+  return { s, decks: undecided(await readDecks(), s) };
+}
+
+/** The feeds in dealing order: as feedList() gives them, then any other that still has cards. */
+function feedOrder(v: View): string[] {
+  return [...new Set([...followed, ...v.decks.keys()])];
+}
+
+/** The cards of the feed being riffled (all feeds, one after another), in order. */
+function cardsIn(v: View): Card[] {
+  const cards = v.s.current ? (v.decks.get(v.s.current) ?? []) : feedOrder(v).flatMap((f) => v.decks.get(f) ?? []);
+  const at = v.s.top ? cards.findIndex((c) => c.id === v.s.top) : -1;
+  return at > 0 ? [cards[at]!, ...cards.slice(0, at), ...cards.slice(at + 1)] : cards;
+}
+
+/** Card `id` (default: the top card of the feed being riffled), if it is undecided. */
+function findCard(v: View, id?: string): Card | undefined {
+  if (!id) return cardsIn(v)[0];
+  for (const cards of v.decks.values()) {
+    const card = cards.find((c) => c.id === id);
+    if (card) return card;
+  }
+  return undefined;
+}
+
+/**
+ * Bounds a deck: at most LIMITS.cards cards and `bytes` bytes of JSON. The oldest go (by date,
+ * then by place in the deck); they are just gone, not marked seen.
+ */
+function bound(cards: Card[], bytes: number): Card[] {
+  let size = utf8Length(JSON.stringify(cards));
+  let n = cards.length;
+  if (n <= LIMITS.cards && size <= bytes) return cards;
+  const oldest = cards.map((c, i) => ({ c, i })).sort((a, b) => (a.c.date ?? "").localeCompare(b.c.date ?? "") || a.i - b.i);
+  const drop = new Set<Card>();
+  for (const { c } of oldest) {
+    if (n <= LIMITS.cards && size <= bytes) break;
+    drop.add(c);
+    n--;
+    size -= utf8Length(JSON.stringify(c)) + 1;
+  }
+  return cards.filter((c) => !drop.has(c));
+}
+
+/** A card as stored: long titles, abstracts and author lists cut. */
+function capCard(card: Card): Card {
+  return {
+    ...card,
+    title: cut(card.title, LIMITS.title),
+    summary: cut(card.summary, LIMITS.summary),
+    authors: card.authors.slice(0, LIMITS.authors).map((a) => cut(a, 100)),
+  };
+}
+
+function cut(s: string, max: number): string {
+  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+
+function utf8Length(s: string): number {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xd800 && c < 0xdc00) (n += 4), i++;
+    else n += 3;
+  }
+  return n;
+}
+
+/** A short stable hash of a string (cyrb53, base 36): a feed's storage key. */
+function hash(s: string): string {
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+}
+
+// Up to 0.2.0 the whole deck was in "state". The first load moves it to one key per feed: each
+// feed's deck is written first, then `deck` leaves the state; a run cut short in between does it
+// again (cards already moved aren't added twice).
+let migration: Promise<void> | null = null;
+
+function migrated(): Promise<void> {
+  migration ??= migrate().catch((e) => {
+    migration = null; // try again next time; meanwhile the old deck stays where it was
+    console.warn("couldn't move the deck to one key per feed:", String(e));
+  });
+  return migration;
+}
+
+async function migrate(): Promise<void> {
+  const old = await zk.storage.get<State & { deck?: Card[] }>(STATE);
+  if (!old?.deck) return;
+  const seen = new Set(old.seen ?? []);
+  const byFeed = new Map<string, Card[]>();
+  for (const card of old.deck) {
+    if (seen.has(card.id)) continue;
+    byFeed.set(card.feed, [...(byFeed.get(card.feed) ?? []), capCard(card)]);
+  }
+  for (const [feed, cards] of byFeed) {
+    await withDeck(feed, (have) => {
+      const ids = new Set(have.map((c) => c.id));
+      return bound([...have, ...cards.filter((c) => !ids.has(c.id))], LIMITS.deckBytes);
+    });
+  }
+  await zk.storage.update<State & { deck?: Card[] }>(STATE, (s) => {
+    if (!s) return s;
+    delete s.deck;
+    s.undo = (s.undo ?? []).map((step) => ({ ...step, card: capCard(step.card) }));
+    return s;
+  });
+  console.log(`moved ${old.deck.length} cards to one storage key per feed (${byFeed.size} feeds)`);
 }
 
 /** Feed address → the name you gave it in Zotero (filled by feedList). */
 let zoteroNames: Record<string, string> = {};
 
+/** The feeds you follow, in feedList()'s order: "All feeds" deals them in this order. */
+let followed: string[] = [];
+
 /** The feeds to riffle: settings.json's, if it lists any; else the ones you follow in Zotero. */
 async function feedList(): Promise<string[]> {
   const own = zk.settings.feeds ?? [];
-  if (own.length) return own;
+  if (own.length) {
+    followed = [...own];
+    return own;
+  }
   const feeds = await zk.library.feeds();
   zoteroNames = Object.fromEntries(feeds.map((f) => [f.url, f.name]));
-  return feeds.map((f) => f.url);
+  followed = feeds.map((f) => f.url);
+  return [...followed];
 }
 
 function hostOf(feed: string): string {
@@ -143,11 +332,31 @@ function feedName(s: State, feed: string | null): string {
   return zoteroNames[feed] ?? s.titles[feed] ?? hostOf(feed);
 }
 
+/**
+ * The address to fetch a feed at: `http://` as `https://` (zk.fetch takes only https), with any
+ * `utm_*` tracking parameters left out. The feed keeps its own address as its identity: its
+ * deck, its name, when it was fetched. (Exported for testing; the app ignores exports.)
+ */
+export function fetchUrl(feed: string): string {
+  let url = feed.trim();
+  if (/^http:\/\//i.test(url)) url = `https://${url.slice("http://".length)}`;
+  const hashAt = url.indexOf("#");
+  const base = hashAt < 0 ? url : url.slice(0, hashAt);
+  const fragment = hashAt < 0 ? "" : url.slice(hashAt);
+  const q = base.indexOf("?");
+  if (q < 0) return url;
+  const params = base
+    .slice(q + 1)
+    .split("&")
+    .filter((p) => p && !/^utm_/i.test(p));
+  return base.slice(0, q) + (params.length ? `?${params.join("&")}` : "") + fragment;
+}
+
 // ───────────────────────────── 2. Background: fetch, parse, dedupe ─────────────────────────────
 
 // After a sync, at most hourly, with 30 seconds in all: fetch the feeds, longest-unfetched first
 // (8 s at most each, so one slow host can't eat the run), parse each, drop what is already dealt or decided, mark what
-// is already in the library, and add the rest to the deck. The badge counts what is new since
+// is already in the library, and add the rest to the feed's deck. The badge counts what is new since
 // the deck was last opened; zk.ui.refresh() redraws the deck if the user is riffling right now.
 zk.background(async () => {
   const added = await refreshFeeds();
@@ -159,21 +368,24 @@ zk.background(async () => {
 });
 
 /**
- * Fetches every feed and adds its new cards to the deck. Resolves how many were added. The feed
+ * Fetches every feed and adds its new cards to its deck. Resolves how many were added. The feed
  * fetched longest ago goes first, and each feed's cards are saved as soon as it is read: a run cut
  * short by its time limit keeps what it found, and the next run starts where it stopped.
  */
 async function refreshFeeds(): Promise<number> {
   const feeds = await feedList();
   const before = await load(); // a snapshot is enough here: the merge below checks again
-  const known = new Set([...before.seen, ...before.deck.map((c) => c.id)]);
-  feeds.sort((a, b) => (before.fetchedAt[a] ?? 0) - (before.fetchedAt[b] ?? 0));
+  const known = new Set([...before.s.seen, ...[...before.decks.values()].flat().map((c) => c.id)]);
+  feeds.sort((a, b) => (before.s.fetchedAt[a] ?? 0) - (before.s.fetchedAt[b] ?? 0));
+  // Each feed's share of the storage, so that all decks together stay under the 16 MB.
+  const bytes = Math.min(LIMITS.deckBytes, Math.floor(LIMITS.allBytes / Math.max(1, new Set([...feeds, ...before.decks.keys()]).size)));
   let added = 0;
   for (const url of feeds) {
     const fresh: Card[] = [];
     let title: string | null = null;
+    const address = fetchUrl(url);
     try {
-      const res = await zk.fetch(url, { timeout: 8000 });
+      const res = await zk.fetch(address, { timeout: 8000 });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const feed = parseFeed(await res.text(), url);
       title = feed.title || null;
@@ -186,15 +398,25 @@ async function refreshFeeds(): Promise<number> {
     } catch (e) {
       // One bad feed shouldn't stop the others. (A LimitError "time" — the whole run's 30 s —
       // can't be caught: it ends the run; what was saved stays, and the next run goes on.)
-      console.warn("skipped feed", url, String(e));
+      console.warn("skipped feed", url, ...(address === url ? [] : [`(fetched as ${address})`]), String(e));
     }
-    added += await withState((s) => {
-      const dealt = new Set([...s.seen, ...s.deck.map((c) => c.id)]); // the user may have decided meanwhile
-      const add = fresh.filter((c) => !dealt.has(c.id));
-      s.deck.push(...add);
+    let kept = 0;
+    if (fresh.length) {
+      await withDeck(url, async (cards) => {
+        // The user may have decided meanwhile.
+        const seen = new Set((await zk.storage.get<State>(STATE))?.seen ?? []);
+        const have = new Set(cards.map((c) => c.id));
+        const add = fresh.filter((c) => !seen.has(c.id) && !have.has(c.id));
+        const after = bound([...cards, ...add], bytes);
+        const left = new Set(after);
+        kept = add.filter((c) => left.has(c)).length;
+        return after;
+      });
+    }
+    added += kept;
+    await withState((s) => {
       if (title) s.titles[url] = title;
       s.fetchedAt[url] = Date.now();
-      return add.length;
     });
   }
   console.log(`${added} new cards`);
@@ -213,6 +435,9 @@ async function inLibrary(card: Card): Promise<string[]> {
 
 // ───────────────────────────── 3. Verdicts ─────────────────────────────
 
+// A verdict picks its card inside a state update, so two verdicts can't take the same card;
+// then it writes the card's deck. Decided cards go into `seen` before they leave the deck.
+
 /**
  * The sitting: what the summary shows. Module state — it starts over when the deck opens (the
  * `open` event) and when the plugin restarts. Only time a card was in front of the user counts:
@@ -228,31 +453,42 @@ function tally(kind: Step["kind"], by = 1): void {
   sitting.last = now;
 }
 
+/** Takes `card` out of its deck (after it went into `seen`). */
+async function dropFromDeck(card: Card): Promise<void> {
+  await withDeck(card.feed, (cards) => cards.filter((c) => c.id !== card.id));
+}
+
 /** Discard: the card is decided and won't come back. */
 async function discard(): Promise<Card | undefined> {
-  const card = await withState((s) => {
-    const card = takeCard(s);
+  const card = await withState(async (s) => {
+    const card = findCard(await viewOf(s));
     if (card) {
       s.seen.push(card.id);
       s.undo.push({ kind: "discard", card });
     }
     return card;
   });
-  if (card) tally("discard");
+  if (card) {
+    await dropFromDeck(card);
+    tally("discard");
+  }
   return card;
 }
 
-/** Skip: to the back of the deck, for another day. */
+/** Skip: to the back of its feed's deck, for another day. */
 async function skip(): Promise<Card | undefined> {
-  const card = await withState((s) => {
-    const card = takeCard(s);
+  const card = await withState(async (s) => {
+    const card = findCard(await viewOf(s));
     if (card) {
-      s.deck.push(card);
       s.undo.push({ kind: "skip", card });
+      if (s.top === card.id) s.top = null;
     }
     return card;
   });
-  if (card) tally("skip");
+  if (card) {
+    await withDeck(card.feed, (cards) => [...cards.filter((c) => c.id !== card.id), card]);
+    tally("skip");
+  }
   return card;
 }
 
@@ -263,7 +499,7 @@ async function skip(): Promise<Card | undefined> {
  */
 async function keep(opts: { cardId?: string; collection?: string | null; tags?: string[]; note?: string } = {}) {
   const kept = await withState(async (s) => {
-    const card = takeCard(s, opts.cardId);
+    const card = findCard(await viewOf(s), opts.cardId);
     if (!card) return null;
 
     // One call makes the item, files it and tags it: one change, which `cancel` withdraws whole.
@@ -280,10 +516,12 @@ async function keep(opts: { cardId?: string; collection?: string | null; tags?: 
     if (opts.collection) {
       s.recent = [opts.collection, ...s.recent.filter((k) => k !== opts.collection)].slice(0, LIMITS.recent);
     }
-    return { itemKey: created.key, replaces: card.inLibrary };
+    return { card, itemKey: created.key, replaces: card.inLibrary };
   });
-  if (kept) tally("keep");
-  return kept;
+  if (!kept) return null;
+  await dropFromDeck(kept.card);
+  tally("keep");
+  return { itemKey: kept.itemKey, replaces: kept.replaces };
 }
 
 /**
@@ -315,6 +553,9 @@ async function replaceOld(oldKey: string, newKey: string): Promise<boolean> {
  * keep withdraws its changes if they haven't been synced yet (no confirmation: nothing left the
  * Kindle). Once synced, a new item can only be trashed — the user is asked — and an old item
  * already trashed in Zotero is restored there, by the user. Resolves a line for the screen.
+ *
+ * The card stays in `seen` until it is back in its deck: a run cut short in between leaves it
+ * decided, never dealt twice.
  */
 async function undo(): Promise<string> {
   const step = await withState((s) => s.undo.pop());
@@ -332,9 +573,10 @@ async function undo(): Promise<string> {
     }
   }
 
+  await withDeck(step.card.feed, (cards) => [step.card, ...cards.filter((c) => c.id !== step.card.id)]);
   await withState((s) => {
-    s.deck = [step.card, ...s.deck.filter((c) => c.id !== step.card.id)];
     s.seen = s.seen.filter((id) => id !== step.card.id);
+    s.top = step.card.id;
   });
   tally(step.kind, -1);
   const done = { discard: "Undid the discard", skip: "Undid the skip", keep: "Undid the keep" }[step.kind];
@@ -360,8 +602,9 @@ zk.screen("deck", {
   main: true,
   render: async () => {
     followed = await feedList(); // and the names you gave them in Zotero
-    const s = await load();
-    const cards = cardsIn(s);
+    const v = await load();
+    const s = v.s;
+    const cards = cardsIn(v);
     const top = cards[0];
     const header = zk.ui.row([
       zk.ui.text(`${feedName(s, s.current)} · ${cards.length} left`, { style: "label" }),
@@ -371,7 +614,7 @@ zk.screen("deck", {
     if (!top) {
       return zk.ui.column([
         header,
-        ...summary(s),
+        ...summary(v),
         zk.ui.buttons([{ id: "undo", title: "Undo" }]),
         message && zk.ui.notice(message),
       ]);
@@ -401,11 +644,10 @@ zk.screen("deck", {
     switch (e.kind) {
       case "open": {
         // A new sitting: the tally starts over, and what the badge announced is now seen.
-        const s = await withState((s) => {
+        await withState((s) => {
           s.fresh = 0;
-          return s;
         });
-        sitting = { kept: 0, discarded: 0, skipped: 0, ms: 0, last: 0, dealt: cardsIn(s).length };
+        sitting = { kept: 0, discarded: 0, skipped: 0, ms: 0, last: 0, dealt: cardsIn(await load()).length };
         message = null;
         zk.setBadge(null);
         return;
@@ -471,13 +713,14 @@ async function recentCollections(recent: string[]): Promise<zk.Collection[]> {
 // ── The end of a sitting: "Done", or the deck running out ──
 
 /** The sitting in figures, and the feeds that still have cards (a list: tap one to riffle it). */
-function summary(s: State): zk.ui.Child[] {
+function summary(v: View): zk.ui.Child[] {
+  const s = v.s;
   const { kept, discarded, skipped, ms, dealt } = sitting;
   const decided = kept + discarded;
-  const left = cardsIn(s).length;
+  const left = cardsIn(v).length;
   const minutes = Math.round(ms / 60_000);
   const perCard = decided + skipped ? Math.round(ms / 1000 / (decided + skipped)) : 0;
-  const others = feedCounts(s).filter((f) => f.count > 0 && f.feed !== s.current);
+  const others = feedCounts(v).filter((f) => f.count > 0 && f.feed !== s.current);
   return [
     zk.ui.text(dealt ? `${decided} of ${dealt} cleared` : "Nothing to riffle", { style: "title" }),
     zk.ui.text(
@@ -509,11 +752,8 @@ zk.screen("summary", {
 // ── Feeds: switch deck, or fetch now ──
 
 /** Each feed — those you follow, then any that still has cards — with its card count. */
-let followed: string[] = [];
-
-function feedCounts(s: State): { feed: string; count: number }[] {
-  const feeds = [...new Set([...followed, ...s.deck.map((c) => c.feed)])];
-  return feeds.map((feed) => ({ feed, count: s.deck.filter((c) => c.feed === feed).length }));
+function feedCounts(v: View): { feed: string; count: number }[] {
+  return feedOrder(v).map((feed) => ({ feed, count: v.decks.get(feed)?.length ?? 0 }));
 }
 
 /** Riffle `feed` (`"*"`: all feeds); resolves a line for the deck's notice. */
@@ -531,10 +771,12 @@ zk.screen("feeds", {
   title: "Feeds",
   render: async () => {
     followed = await feedList();
-    const s = await load();
+    const v = await load();
+    const s = v.s;
+    const counts = feedCounts(v);
     const rows: zk.ui.ListRow[] = [
-      { id: "*", title: "All feeds", meta: `${s.deck.length}`, selected: s.current === null },
-      ...feedCounts(s).map(({ feed, count }) => ({
+      { id: "*", title: "All feeds", meta: `${counts.reduce((n, f) => n + f.count, 0)}`, selected: s.current === null },
+      ...counts.map(({ feed, count }) => ({
         id: feed,
         title: feedName(s, feed),
         subtitle: hostOf(feed),
@@ -655,8 +897,9 @@ zk.screen<{ cardId: string }>("file", {
 });
 
 async function startDraft(cardId: string): Promise<Draft | null> {
-  const s = await load();
-  const card = s.deck.find((c) => c.id === cardId);
+  const v = await load();
+  const s = v.s;
+  const card = findCard(v, cardId);
   if (!card) return null;
   const [collections, tags] = await Promise.all([zk.library.collections(), zk.library.tags()]);
   const old = [];
@@ -734,7 +977,7 @@ export function parseFeed(xml: string, feed: string): { title: string | null; ca
   const entries = filter(nodes, (n) => n.tagName === "item" || n.tagName === "entry");
   const channel = filter(nodes, (n) => n.tagName === "channel" || n.tagName === "feed")[0];
   const title = channel ? oneLine(stripTags(text(child(channel, "title")))) : "";
-  return { title: title || null, cards: entries.map((entry) => toCard(entry, feed)).filter((c) => c.title) };
+  return { title: title || null, cards: entries.map((entry) => capCard(toCard(entry, feed))).filter((c) => c.title) };
 }
 
 function toCard(entry: TNode, feed: string): Card {

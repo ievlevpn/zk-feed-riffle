@@ -1,7 +1,7 @@
 {
   "id": "feed-riffle",
   "name": "Feed Riffle",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "api": 0,
   "minApp": "0.6.0",
   "author": "Pavel Ievlev",

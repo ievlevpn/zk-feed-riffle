@@ -20,7 +20,7 @@ Each card shows the title, authors, date and abstract (plain text; LaTeX stays a
 |---|---|
 | swipe left, **Discard** | the card is decided and gone |
 | swipe right, **Keep** | opens the filing screen |
-| **Skip** | to the back of the deck, for another day |
+| **Skip** | to the back of its feed's deck, for another day |
 | a chip under **File into** | keeps it straight into that recent collection |
 | **Undo** | takes back the last discard, skip or keep |
 | **Feeds** | riffle one feed, or all of them; **Fetch now** |
@@ -46,10 +46,22 @@ card*; a gap over five minutes isn't counted) and the feeds that still have card
 - **Fetches feeds itself.** Zotero's feed reader isn't on the Kindle, so the background task
   (after a sync, at most hourly) fetches each of your Zotero feeds (or those in `settings.json`),
   the one fetched longest ago first, saving each feed's cards as soon as it is read. It parses RSS 2.0, RSS 1.0 or
-  Atom, and adds new entries to a deck kept in the plugin's storage; the badge says how many are
+  Atom, and adds new entries to that feed's deck in the plugin's storage; the badge says how many are
   new. It parses with [txml](https://www.npmjs.com/package/txml) 6.0.3 (pinned; no dependencies,
   no Node or DOM APIs), bundled into `main.js`.
-- **Never deals a card twice**: a card already dealt or decided isn't dealt again.
+- **Fetches `http://` feeds over `https://`** (the app fetches only https), at the same address
+  otherwise, and leaves out `utm_*` tracking parameters; the feed keeps its own address as its
+  name and identity. A feed that can't be fetched that way, or whose site refuses automated
+  clients (`HTTP 403`, `418`), is skipped and logged once per run.
+- **One deck per feed.** Each feed's undecided cards are kept in a storage key of their own,
+  apart from the history (what you decided, Undo, recent collections). A feed keeps at most 150
+  undecided cards — over that, its oldest are dropped (not marked decided: they are just gone) —
+  and an abstract keeps its first 1,500 characters, so the plugin stays within the app's storage
+  limits (1 MB a value, 16 MB in all) however long the backlog. **All feeds** deals the feeds in
+  the order you follow them; **Skip** sends a card to the back of its feed's deck. A deck saved
+  by 0.2.0 or earlier (in one key) is moved to the new layout the first time it is read.
+- **Never deals a card twice**: a card already dealt or decided isn't dealt again, even if the
+  Kindle stops between saving the verdict and saving the deck.
 ## Permissions
 
 | Permission | Why |
