@@ -66,6 +66,13 @@ declare var console: {
  * with 5 seconds. Pending timers are dropped when the call that set them is stopped by a limit,
  * and when the plugin is turned off. Returns an id for {@link clearTimeout}. No permission.
  *
+ * A delay under 100 ms (or none) is raised to 100 ms. A plugin may have at most 1000 timers
+ * pending; one more throws a {@link zk.LimitError} `"timers"` (nothing is set).
+ *
+ * While the app is in the background (another Kindle app or the screensaver is up), a timer whose
+ * call has ended doesn't fire: it waits and runs, late, when the app is back in front. Timers of a
+ * call still running fire as usual.
+ *
  * Quiet run time: outside calls the user caused and the background task, a plugin's code may run
  * at most 2 s in any minute (sync events, loading, and timers and continuations of calls that have
  * ended all count). Once that is used, a timer whose call has ended runs late, when the minute
@@ -509,14 +516,29 @@ declare namespace zk {
     function findByIdentifier(id: { doi?: string; arxiv?: string; isbn?: string }): Promise<Item[]>;
 
     /**
-     * All collections, each with its full path, sorted by path.
+     * All collections, each with its full path: My Library's first, then each group library's
+     * (see {@link libraries}), each sorted by path.
      *
      * **Permission**: `library:read`.
      *
      * @example
-     * const inbox = (await zk.library.collections()).find((c) => c.path.join("/") === "Reading/Inbox");
+     * const inbox = (await zk.library.collections()).find((c) => c.libraryId === 0 && c.path.join("/") === "Reading/Inbox");
      */
     function collections(): Promise<Collection[]>;
+
+    /**
+     * The libraries on the Kindle: My Library (`id` 0) first, then the user's Zotero group
+     * libraries that sync (switched on in Settings → Group libraries, and still available), by
+     * name. Items, collections and annotations carry their library's `libraryId` and
+     * `libraryName`. Needs app 0.8.0.
+     *
+     * **Permission**: `library:read`.
+     *
+     * @example
+     * for (const lib of await zk.library.libraries())
+     *   if (!lib.editable) console.log(`${lib.name}: read-only, changes there are refused`);
+     */
+    function libraries(): Promise<LibraryInfo[]>;
 
     /**
      * The user's Zotero feed subscriptions, as of the last sync, sorted by name. Read-only: the
@@ -616,6 +638,8 @@ declare namespace zk {
     collection?: string;
     /** Only items with this tag (its name, exact). */
     tag?: string;
+    /** Only items of this library: 0 My Library, else a group's id ({@link zk.library.libraries}). Needs app 0.8.0. */
+    library?: number;
     /** Stop after this many items. */
     limit?: number;
   }
@@ -643,6 +667,11 @@ declare namespace zk {
    *   resolve `null` without asking (the log says so). Nothing is ever deleted for good except a note this plugin created:
    *   items go to Zotero's trash.
    * - **Editing** existing data (a title, a note, an annotation) is not possible in API v0.
+   * - **Group libraries**: a change goes to the library of what it changes (a new item to its
+   *   collections' library; none means My Library). It is refused, with a message saying why, when
+   *   that group is read-only for the user, switched off on the Kindle or no longer available, and
+   *   when it mixes libraries (collections of two libraries, or an item filed into another
+   *   library's collection). See {@link zk.library.libraries} (`editable`).
    */
   namespace zotero {
     /**
@@ -829,11 +858,17 @@ declare namespace zk {
    * (see {@link LimitError}: what it started is cancelled). An error it throws is logged with
    * its stack.
    *
+   * A plugin may register at most 100 handlers for each event; one more throws a
+   * {@link LimitError} `"handlers"` (it isn't registered).
+   *
    * Every event says where the change was made: `origin: "kindle"` (the user did it on this
    * Kindle, one event per change, as it happens) or `origin: "zotero"` (it came in with a sync:
    * one event per kind per sync, listing everything). So events that can arrive with a sync carry
    * a list — `annotations` or `items` — with one entry when the change was made on the Kindle.
-   * The first full sync of a library fires only `syncFinished` (with `initial: true`).
+   * The first full sync of a library fires only `syncFinished` (with `initial: true`). That holds for
+   * each group library too: the sync in which a group is first downloaded (newly joined, or switched
+   * on again after its copy was removed) ends with `initial: true`, even when My Library had synced
+   * before, so a plugin that keeps an index rebuilds it then.
    *
    * **Permission**: what the event carries — `annotations:read` for `highlight…` events,
    * `library:read` for `book…` and `itemMarked…` events; `syncFinished` needs none.
@@ -872,7 +907,10 @@ declare namespace zk {
     /** A sync with Zotero finished successfully (fires after the other events of that sync). */
     syncFinished: {
       origin: "zotero";
-      /** `true` for the first full sync of a library, which fires no other events. */
+      /**
+       * `true` when this sync was the first full sync of any library — My Library or a group — which
+       * fires no other events for that library.
+       */
       initial: boolean;
     };
   }
@@ -1031,10 +1069,12 @@ declare namespace zk {
   interface TextSelection {
     /** The selected text. */
     text: string;
-    /** The item being read. */
-    item: Item;
-    /** The file being read. */
-    attachment: Attachment;
+    /** The item being read; `null` in a preview ({@link zk.reader.open}, app 0.9.0). */
+    item: Item | null;
+    /** The file being read; `null` in a preview. */
+    attachment: Attachment | null;
+    /** In a preview (app 0.9.0): what is being read instead of an item. */
+    preview?: { title: string; url: string | null };
     /** The page label where the selection starts, if the document has pages. */
     pageLabel: string | null;
   }
@@ -1170,6 +1210,15 @@ declare namespace zk {
      * card with the reader's page-turn feel when the next render shows another). With no card,
      * shows `empty`.
      *
+     * A deck is the screen's main thing: in a screen's top-level {@link column} it takes all the
+     * height the other blocks leave, and the blocks after it sit at the bottom of the screen. Every
+     * card — short, long, or none — has that same size, so nothing around it moves from card to
+     * card; a long body pages inside the card (up/down swipes, "2 / 3" in its corner). Needs app
+     * 0.9.0 (before, a deck took its card's height).
+     *
+     * Tapping the card sends a `tap` event with the deck's `id` (e.g. to open the paper with
+     * {@link zk.reader.open}). Needs app 0.9.0.
+     *
      * @example
      * zk.ui.deck({ id: "cards", card: top && zk.ui.card({ title: top.title }), empty: "Nothing left to riffle" });
      */
@@ -1252,12 +1301,14 @@ declare namespace zk {
     function space(size?: Size): SpaceBlock;
 
     /**
-     * A quiet one-line message: the outcome of the last step, a hint.
+     * A quiet one-line message: the outcome of the last step, a hint. With an `id`, tapping it
+     * sends a `tap` event with that id (needs app 0.9.0).
      *
      * @example
      * zk.ui.notice("Discarded. 3 cards skipped for later.");
+     * zk.ui.notice("Kept into Probability", { id: "read-kept" }); // tap: read it
      */
-    function notice(text: string): NoticeBlock;
+    function notice(text: string, opts?: { id?: string }): NoticeBlock;
 
     // ── Navigation ──
 
@@ -1286,7 +1337,9 @@ declare namespace zk {
     /**
      * Renders the plugin's showing screen again, if one is showing: after work outside `onEvent`
      * changed what it shows (a background refresh brought new cards). Callable from anywhere;
-     * does nothing when no screen of the plugin is showing.
+     * does nothing when no screen of the plugin is showing. Outside what the user does (a timer,
+     * the background task), refreshes are merged into at most one render a second; one from a
+     * user-caused call (an action, a handler of what the user did) renders at once.
      *
      * @example
      * zk.background(async () => { await refreshFeeds(); zk.ui.refresh(); });
@@ -1477,6 +1530,8 @@ declare namespace zk {
     interface NoticeBlock {
       kind: "notice";
       text: string;
+      /** Makes it tappable: a tap sends a `tap` event with this id. Needs app 0.9.0. */
+      id?: string;
     }
 
     /**
@@ -1486,7 +1541,8 @@ declare namespace zk {
      *
      * - `open` — the screen is opening; first, before its first render ("Loading…" shows until
      *   it returns). For set-up slower than `render`'s 1 s.
-     * - `tap` — a {@link button}, or one of {@link buttons}, by its `id`.
+     * - `tap` — a {@link button}, or one of {@link buttons}, by its `id`; the {@link deck}'s card,
+     *   by the deck's `id`; a {@link notice} with an `id` (the last two need app 0.9.0).
      * - `select` — a {@link list} row: `id` is the list's, `row` the row's.
      * - `swipe` — the {@link deck}'s card, left or right.
      * - `change` / `submit` — a {@link search} or {@link field}: its whole text.
@@ -1495,6 +1551,8 @@ declare namespace zk {
      * - `result` — a screen this one opened has closed: its id and what {@link close} gave
      *   (`undefined` if closed with Back or without a result).
      * - `back` — the user left this screen. It is already closed; nothing is rendered after.
+     * - `reader` — a preview this screen opened with {@link zk.reader.open} closed (`closed:
+     *   true`): the screen shows again as it was. Needs app 0.9.0.
      *
      * @example
      * onEvent: async (e) => {
@@ -1512,7 +1570,44 @@ declare namespace zk {
       | { kind: "submit"; id: string; text: string }
       | { kind: "chips"; id: string; chip: string; selected: string[] }
       | { kind: "result"; from: string; value: Json | undefined }
-      | { kind: "back" };
+      | { kind: "back" }
+      | { kind: "reader"; closed: true };
+  }
+
+  // ───────────────────────────── The reader ─────────────────────────────
+
+  /**
+   * The app's reader, for documents that aren't in the library. Needs app 0.9.0.
+   */
+  namespace reader {
+    /**
+     * Opens a document in the app's reader as a **preview**: nothing is added to the library.
+     *
+     * - `url`: a PDF or EPUB to download (https only, and the plugin needs `net` permission for
+     *   its host, as for {@link zk.fetch}). The type comes from the response's Content-Type, then
+     *   from the file's first bytes; a page that turns out to be HTML opens as `html`. A download
+     *   screen shows the progress with **Cancel**. At most 50 MB.
+     * - `html`: a page the plugin already has (an article it extracted), opened like a saved web
+     *   page. No scripts run; images aren't fetched (`data:` URLs show). `baseUrl` resolves its
+     *   relative links.
+     *
+     * In a preview there is no highlighting, notes or bookmarks: a selection offers Search and
+     * plugin actions (their {@link TextSelection} has `item: null` and `preview`). The top bar says
+     * "Preview". Nothing syncs. The app keeps the last 10 previewed documents (at most 100 MB) with
+     * their reading places, so opening one again is instant.
+     *
+     * Only in answer to the user (a screen's `onEvent`, an action's `run`), like {@link zk.ui.open};
+     * elsewhere, or with a URL that isn't https or whose host isn't declared, it throws. The
+     * promise resolves when the reader shows, and rejects if the download fails or the user
+     * cancels it; waiting doesn't count against the call's time. Back returns to the screen as it
+     * was, and the screen gets a `{ kind: "reader", closed: true }` event.
+     *
+     * @example
+     * if (e.kind === "tap" && e.id === "card") await zk.reader.open({ url: `https://arxiv.org/pdf/${card.arxiv}`, title: card.title });
+     * @example
+     * await zk.reader.open({ html: article, title: card.title, baseUrl: card.link });
+     */
+    function open(doc: { url: string; title?: string } | { html: string; title: string; baseUrl?: string }): Promise<void>;
   }
 
   // ───────────────────────────── Data ─────────────────────────────
@@ -1556,6 +1651,10 @@ declare namespace zk {
      * `Citation Key:` line Better BibTeX writes into *Extra*.
      */
     citationKey: string | null;
+    /** Its library: 0 My Library, else the Zotero group's id. Needs app 0.8.0. */
+    libraryId: number;
+    /** Its library's name: `"My Library"` or the group's name. Needs app 0.8.0. */
+    libraryName: string;
   }
 
   /** Zotero item types. Others exist; these are the common ones. */
@@ -1607,6 +1706,22 @@ declare namespace zk {
     parent: string | null;
     /** Names from the top level down, ending with its own: `["Reading", "arXiv"]`. */
     path: string[];
+    /** Its library: 0 My Library, else the Zotero group's id. Needs app 0.8.0. */
+    libraryId: number;
+    /** Its library's name: `"My Library"` or the group's name. Needs app 0.8.0. */
+    libraryName: string;
+  }
+
+  /** A library on the Kindle: My Library or a Zotero group library ({@link zk.library.libraries}). */
+  interface LibraryInfo {
+    /** 0 for My Library, else the Zotero group's id. */
+    id: number;
+    /** `"My Library"`, or the group's name. */
+    name: string;
+    /** Whether changes there can go to Zotero (My Library always; a group when the user may edit it). */
+    editable: boolean;
+    /** How many top-level items it has on the Kindle. */
+    items: number;
   }
 
   /** A Zotero feed subscription. */
@@ -1657,6 +1772,10 @@ declare namespace zk {
     created: string;
     /** ISO 8601. */
     modified: string;
+    /** Its library: 0 My Library, else the Zotero group's id. Needs app 0.8.0. */
+    libraryId: number;
+    /** Its library's name: `"My Library"` or the group's name. Needs app 0.8.0. */
+    libraryName: string;
   }
 
   /** A Zotero note attached to an item. */
@@ -1751,9 +1870,10 @@ declare namespace zk {
     private constructor();
     readonly name: "LimitError";
     /**
-     * Which limit: run time, memory, stack depth, a fetch's response size or duration, or too many
-     * fetches under way at once.
+     * Which limit: run time, memory, stack depth, a fetch's response size or duration, too many
+     * fetches under way at once, too many timers pending ({@link setTimeout}), or too many handlers
+     * for one event ({@link on}).
      */
-    readonly limit: "time" | "memory" | "stack" | "responseSize" | "responseTime" | "fetches";
+    readonly limit: "time" | "memory" | "stack" | "responseSize" | "responseTime" | "fetches" | "timers" | "handlers";
   }
 }

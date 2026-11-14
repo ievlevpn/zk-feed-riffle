@@ -7,24 +7,41 @@ workaround, the API is wrong — and commented as a walk-through of plugin scree
 
 ## Install
 
-On the Kindle (Zotero for Kindle 0.6.0 or later): *Settings → Plugins → Get plugins → Feed Riffle →
+On the Kindle (Zotero for Kindle 0.9.0 or later; Feed Riffle 0.3.0 runs on 0.6.0): *Settings → Plugins → Get plugins → Feed Riffle →
 Install*, then turn it on. It riffles the feeds you follow in Zotero (*New Feed* in Zotero's
 desktop app; they sync to the Kindle with your library), under the names you gave them there.
 
 ## Use
 
 **Plugins** on Home (the puzzle-piece icon; a dot when there are new cards) → **Feed Riffle**.
-Each card shows the title, authors, date and abstract (plain text; LaTeX stays as source).
+Each card shows the title, authors, date and abstract (plain text; LaTeX stays as source). The
+card fills the screen and keeps its size from card to card, so the buttons never move; a long
+abstract pages inside the card (swipe up and down, "2 / 3" in its corner).
 
 | | |
 |---|---|
 | swipe left, **Discard** | the card is decided and gone |
 | swipe right, **Keep** | opens the filing screen |
+| tap the card | reads the paper, without keeping or discarding it (below) |
 | **Skip** | to the back of its feed's deck, for another day |
 | a chip under **File into** | keeps it straight into that recent collection |
 | **Undo** | takes back the last discard, skip or keep |
 | **Feeds** | riffle one feed, or all of them; **Fetch now** |
 | **Done** | the sitting in figures |
+
+**Reading before deciding**: tap the card. An arXiv paper opens as its PDF
+(`arxiv.org/pdf/<id>`); otherwise the feed's own full text, if it carries one clearly longer than
+the summary; otherwise the entry's page — a PDF as a PDF, a web page reduced to its article
+(`<article>`, else `<main>`, else the largest run of paragraphs; no scripts, navigation, headers,
+footers, asides, forms or pictures) — and, if nothing usable comes out of it, the summary as a
+page. It opens in the app's reader as a preview: nothing is added to your library, there is no
+highlighting, and **Back** returns to the same card, still undecided. PDFs download with a
+progress screen and **Cancel**; the app keeps the last ten documents read this way, so opening one
+again is instant.
+
+**Right after a keep**, the notice says *Kept into Probability*: tap it to read the kept paper the
+same way. (The new Zotero item has no file — the Kindle can't upload one — and appears in the app's
+Library after the next sync.)
 
 **Filing**: search your collections (every word typed must be in the path), pick one — the panel
 starts on the one you used last — add tags (matching tags are offered as you type) and a note,
@@ -66,7 +83,7 @@ card*; a gap over five minutes isn't counted) and the feeds that still have card
 
 | Permission | Why |
 |---|---|
-| `net:*` | feeds can be on any host (arXiv, journals, blogs) |
+| `net:*` | feeds can be on any host (arXiv, journals, blogs); so can the papers and pages you read |
 | `library:read` | your Zotero feeds; find items by DOI or arXiv id; list collections |
 | `notes:read` | read the old item's notes, to copy them when replacing it |
 | `zotero:create-items` | create the kept item |
