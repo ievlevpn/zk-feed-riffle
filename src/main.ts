@@ -21,6 +21,8 @@
 //                   verdicts). The app draws the blocks in its own style and redraws only what
 //                   changed; the plugin never draws, animates or picks an e-ink refresh.
 //   5. Feeds        RSS 2.0, RSS 1.0 and Atom, parsed with txml (bundled into main.js).
+//   6. Reading      tap the card (or the "Kept into …" notice) to read the paper in the app's
+//                   reader without deciding anything: zk.reader.open, a preview.
 //
 // On the Kindle there is no Zotero feed reader, so the plugin reads the feeds itself: the ones
 // you subscribe to in Zotero (synced, zk.library.feeds), or the ones settings.json lists.
@@ -61,6 +63,11 @@ interface Card {
   arxiv: string | null;
   /** Keys of library items with the same DOI or arXiv id (any version): the replace candidates. */
   inLibrary: string[];
+  /**
+   * The feed carries the entry's full text (`content:encoded`, Atom `content`), clearly longer
+   * than its summary: Read opens that. Not stored (it can be long); fetched again with the feed.
+   */
+  full?: boolean;
 }
 
 /** One step of the undo history. A keep remembers the changes it asked of Zotero. */
@@ -597,6 +604,11 @@ async function undo(): Promise<string> {
 /** The last verdict's outcome, shown quietly under the buttons. */
 let message: string | null = null;
 
+/** The card just kept, while its "Kept into …" notice shows: tapping the notice reads it. */
+let keptCard: Card | null = null;
+/** The card the filing screen just kept (it closes with a line; the deck picks the card up here). */
+let justFiled: Card | null = null;
+
 zk.screen("deck", {
   title: "Feed Riffle",
   main: true,
@@ -616,7 +628,7 @@ zk.screen("deck", {
         header,
         ...summary(v),
         zk.ui.buttons([{ id: "undo", title: "Undo" }]),
-        message && zk.ui.notice(message),
+        message && zk.ui.notice(message, keptCard ? { id: "kept" } : undefined),
       ]);
     }
     const recent = await recentCollections(s.recent);
@@ -637,10 +649,13 @@ zk.screen("deck", {
         { id: "undo", title: "Undo" },
         { id: "done", title: "Done" },
       ]),
-      message && zk.ui.notice(message),
+      // Right after a keep, the notice opens the kept paper: tap "Kept into …" to read it.
+      message && zk.ui.notice(message, keptCard ? { id: "kept" } : undefined),
     ]);
   },
   onEvent: async (e) => {
+    // The notice reads the kept paper only while it says so: any other step makes it plain again.
+    if (e.kind !== "reader" && !(e.kind === "tap" && (e.id === "card" || e.id === "kept"))) keptCard = null;
     switch (e.kind) {
       case "open": {
         // A new sitting: the tally starts over, and what the badge announced is now seen.
@@ -655,6 +670,9 @@ zk.screen("deck", {
       case "swipe":
         return e.direction === "left" ? onDiscard() : onKeep();
       case "tap":
+        // The card: read its paper, deciding nothing (the card stays on top).
+        if (e.id === "card") return onRead(cardsIn(await load())[0]);
+        if (e.id === "kept") return onRead(keptCard ?? undefined);
         if (e.id === "discard") return onDiscard();
         if (e.id === "keep") return onKeep();
         if (e.id === "skip") {
@@ -667,9 +685,11 @@ zk.screen("deck", {
         return;
       case "chips": {
         // A recent collection: file straight away, no filing screen.
-        const kept = await keep({ collection: e.chip });
+        const top = cardsIn(await load())[0];
+        const done = await keep({ collection: e.chip });
         const name = (await zk.library.collections()).find((c) => c.key === e.chip)?.name ?? "the collection";
-        message = kept ? `Kept into ${name}` : null;
+        message = done ? `Kept into ${name}` : null;
+        keptCard = done && top ? top : null;
         return;
       }
       case "select": // a feed in the summary's list (when the deck has run out)
@@ -677,6 +697,10 @@ zk.screen("deck", {
         return;
       case "result": // the filing screen, the feeds or the summary closed; they say what happened
         if (typeof e.value === "string") message = e.value;
+        keptCard = justFiled;
+        justFiled = null;
+        return;
+      case "reader": // back from reading: the screen is as it was
         return;
     }
   },
@@ -947,6 +971,7 @@ async function fileDraft(d: Draft): Promise<string> {
   draft = null;
   const kept = await keep({ cardId: d.card.id, collection: d.collection, tags: d.tags, note: d.note });
   if (!kept) return "That card is no longer in the deck";
+  justFiled = d.card;
   const where = d.collections.find((c) => c.key === d.collection)?.name;
   let line = where ? `Kept into ${where}` : "Kept";
   if (d.replace && kept.replaces.length) {
@@ -988,6 +1013,7 @@ function toCard(entry: TNode, feed: string): Card {
   const arxiv = ids.match(/arxiv\.org\/abs\/([^\s?#]+)|oai:arXiv\.org:(\S+)|arXiv:(\d{4}\.\d{4,5}(?:v\d+)?)/i)?.slice(1).find(Boolean) ?? null;
   const doi = (text(child(entry, "prism:doi") ?? child(entry, "arxiv:doi")) || ids.match(/\b10\.\d{4,9}\/\S+/)?.[0]) ?? null;
   const date = text(child(entry, "pubDate") ?? child(entry, "published") ?? child(entry, "dc:date") ?? child(entry, "updated"));
+  const summary = oneLine(stripTags(text(child(entry, "description") ?? child(entry, "summary") ?? child(entry, "content"))));
   return {
     id: arxiv ? `arxiv:${arxiv}` : doi ? `doi:${doi.toLowerCase()}` : guid || link || text(child(entry, "title")),
     feed,
@@ -995,11 +1021,36 @@ function toCard(entry: TNode, feed: string): Card {
     authors: authorsOf(entry),
     date: date ? isoDate(date) : null,
     link: link || null,
-    summary: oneLine(stripTags(text(child(entry, "description") ?? child(entry, "summary") ?? child(entry, "content")))),
+    summary,
     doi: doi || null,
     arxiv,
     inLibrary: [],
+    full: isFull(entry),
   };
+}
+
+/** The entry's full text (`content:encoded`, Atom `content`), as HTML; "" if it has none. */
+function fullText(entry: TNode): string {
+  return text(child(entry, "content:encoded") ?? child(entry, "content"));
+}
+
+/**
+ * Whether the entry's full text is worth reading instead of its page: clearly longer than its
+ * summary (twice as long, and over 1,500 characters — what a card keeps of a summary).
+ */
+function isFull(entry: TNode): boolean {
+  const full = oneLine(stripTags(fullText(entry))).length;
+  const own = child(entry, "description") ?? child(entry, "summary");
+  const summary = own ? oneLine(stripTags(text(own))).length : 0;
+  return full > LIMITS.summary && full >= 2 * summary;
+}
+
+/** The full text of the entry that became card `id` in this feed, if the feed still has it. */
+export function entryFullText(xml: string, feed: string, id: string): string | null {
+  const nodes = parse(xml, { selfClosingTags: [], decodeEntities: true });
+  for (const entry of filter(nodes, (n) => n.tagName === "item" || n.tagName === "entry"))
+    if (toCard(entry, feed).id === id) return fullText(entry) || null;
+  return null;
 }
 
 function child(node: TNode, name: string): TNode | undefined {
@@ -1050,6 +1101,160 @@ function oneLine(s: string): string {
 function isoDate(s: string): string {
   const d = new Date(s);
   return Number.isNaN(d.getTime()) ? s : d.toISOString().slice(0, 10);
+}
+
+// ───────────────────────────── 6. Reading ─────────────────────────────
+
+// Tapping the card (or, right after a keep, its "Kept into …" notice) opens the paper in the app's
+// reader as a preview: nothing is added to the library, nothing is decided, and Back comes back to
+// the same card. What opens:
+//   - an arXiv paper: its PDF, https://arxiv.org/pdf/<id with version> (reliable, with the maths;
+//     arXiv's HTML versions are missing for many papers);
+//   - else the feed's own full text, when it carries one clearly longer than the summary;
+//   - else the entry's link: a PDF opens as a PDF; a page is reduced to its article (below);
+//   - and if nothing usable comes out, the summary as a page.
+// The app downloads PDFs itself, with a progress screen and Cancel; zk.reader.open resolves when
+// the reader shows. A Kindle has no file to attach to the kept item (the app doesn't upload), so
+// reading it is what "go to the kept item" means here.
+
+async function onRead(card: Card | undefined): Promise<void> {
+  if (!card) return;
+  try {
+    await zk.reader.open(await readable(card));
+  } catch (e) {
+    const why = e instanceof Error ? e.message : String(e);
+    if (why !== "Cancelled") message = `Couldn't open “${short(card.title)}”: ${why}`;
+    keptCard = null;
+  }
+}
+
+type Readable = { url: string; title?: string } | { html: string; title: string; baseUrl?: string };
+
+/** What Read opens for `card`. */
+async function readable(card: Card): Promise<Readable> {
+  if (card.arxiv) return { url: `https://arxiv.org/pdf/${card.arxiv}`, title: card.title };
+  if (card.full) {
+    const html = await feedFullText(card).catch(() => null);
+    if (html) return { html: page(card, html), title: card.title, baseUrl: card.link ?? undefined };
+  }
+  if (card.link) {
+    const found = await fromLink(fetchUrl(card.link)).catch((e) => {
+      console.warn("couldn't read", card.link, String(e));
+      return null;
+    });
+    if (found && "url" in found) return { url: found.url, title: card.title };
+    if (found) return { html: page(card, found.html), title: card.title, baseUrl: found.baseUrl };
+  }
+  return { html: page(card, `<p>${escapeHtml(card.summary || "No summary.")}</p>`), title: card.title };
+}
+
+/** The entry's full text, from the feed fetched again (cards don't keep it: it can be long). */
+async function feedFullText(card: Card): Promise<string | null> {
+  const res = await zk.fetch(fetchUrl(card.feed), { timeout: 8000 });
+  if (!res.ok) return null;
+  return entryFullText(await res.text(), card.feed, card.id);
+}
+
+/**
+ * The entry's link: a PDF or EPUB (as its Content-Type says; asked with HEAD, so the app downloads
+ * it only once), or the page's article as HTML. null if nothing usable came out.
+ */
+async function fromLink(url: string): Promise<{ url: string } | { html: string; baseUrl: string } | null> {
+  const isDocument = (type: string | null) => /application\/(pdf|x-pdf|epub\+zip)/i.test(type ?? "");
+  const head = await zk.fetch(url, { method: "HEAD", timeout: 8000 }).catch(() => null);
+  if (head?.ok && isDocument(head.headers.get("content-type"))) return { url: head.url || url };
+  const res = await zk.fetch(url, { timeout: 15000 });
+  if (!res.ok) return null;
+  if (isDocument(res.headers.get("content-type"))) return { url: res.url || url };
+  const article = extractArticle(await res.text());
+  return article ? { html: article, baseUrl: res.url || url } : null;
+}
+
+/** The page the reader shows: the card's title, authors and date, then `body`. */
+function page(card: Card, body: string): string {
+  const meta = [card.authors.slice(0, 6).join(", ") + (card.authors.length > 6 ? " et al." : ""), card.date]
+    .filter(Boolean)
+    .join(" · ");
+  return `<h1>${escapeHtml(card.title)}</h1>${meta ? `<p><i>${escapeHtml(meta)}</i></p>` : ""}${body}`;
+}
+
+/**
+ * A web page's article, as clean HTML: `<article>`, else `<main>`, else the largest block of
+ * `<p>`s; scripts, styles, navigation, headers, footers, asides and forms dropped, and images
+ * other than data: URLs (the reader fetches nothing). null if under a few hundred characters of
+ * text came out. Plain string work (txml reads XML, and pages are rarely that). (Exported for
+ * testing; the app ignores exports.)
+ */
+export function extractArticle(html: string): string | null {
+  let h = html.replace(/<!--[\s\S]*?-->/g, "");
+  for (const tag of ["script", "style", "noscript", "template", "svg", "iframe", "nav", "header", "footer", "aside", "form", "button"])
+    h = dropElements(h, tag);
+  const body = largestElement(h, "article") ?? largestElement(h, "main") ?? largestParagraphBlock(h);
+  if (!body) return null;
+  const clean = body
+    .replace(/<img\b(?![^>]*\bsrc\s*=\s*["']?data:)[^>]*>/gi, "")
+    .replace(/\s(on\w+|style|class|id)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "");
+  return oneLine(stripTags(clean)).length >= 400 ? clean : null;
+}
+
+/** `html` without every <tag …>…</tag> (nested ones included). */
+function dropElements(html: string, tag: string): string {
+  const open = new RegExp(`<${tag}\\b[^>]*>`, "i");
+  let h = html;
+  for (let guard = 0; guard < 500; guard++) {
+    const m = open.exec(h);
+    if (!m) break;
+    const end = closingOf(h, tag, m.index);
+    h = h.slice(0, m.index) + (end < 0 ? "" : h.slice(end));
+  }
+  return h;
+}
+
+/** Where the element opened at `at` ends (after its closing tag), counting nested ones; -1 if never. */
+function closingOf(html: string, tag: string, at: number): number {
+  const re = new RegExp(`<(/?)${tag}\\b[^>]*>`, "gi");
+  re.lastIndex = at;
+  let depth = 0;
+  for (let m = re.exec(html); m; m = re.exec(html)) {
+    if (m[0].endsWith("/>")) continue;
+    depth += m[1] ? -1 : 1;
+    if (depth === 0) return m.index + m[0].length;
+  }
+  return -1;
+}
+
+/** The inside of the <tag> element with the most text, if any. */
+function largestElement(html: string, tag: string): string | null {
+  const re = new RegExp(`<${tag}\\b[^>]*>`, "gi");
+  let best: string | null = null;
+  let bestLength = 0;
+  for (let m = re.exec(html); m; m = re.exec(html)) {
+    const end = closingOf(html, tag, m.index);
+    if (end < 0) continue;
+    const inner = html.slice(m.index + m[0].length, html.lastIndexOf("<", end - 1));
+    const length = oneLine(stripTags(inner)).length;
+    if (length > bestLength) (best = inner), (bestLength = length);
+  }
+  return bestLength >= 400 ? best : null;
+}
+
+/** The run of <p>s (with little but markup between them) that holds the most text. */
+function largestParagraphBlock(html: string): string | null {
+  const paragraphs = [...html.matchAll(/<p\b[^>]*>[\s\S]*?<\/p>/gi)];
+  let best: string[] = [];
+  let bestLength = 0;
+  let run: string[] = [];
+  let runLength = 0;
+  let last = -1;
+  for (const m of paragraphs) {
+    const between = last < 0 ? "" : html.slice(last, m.index);
+    if (last >= 0 && oneLine(stripTags(between)).length > 80) (run = []), (runLength = 0);  // other text between: a new block
+    run.push(m[0]);
+    runLength += oneLine(stripTags(m[0])).length;
+    if (runLength > bestLength) (best = [...run]), (bestLength = runLength);
+    last = m.index + m[0].length;
+  }
+  return bestLength > 0 ? best.join("\n") : null;
 }
 
 // ───────────────────────────── Card → Zotero item ─────────────────────────────
