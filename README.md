@@ -62,14 +62,17 @@ card*; a gap over five minutes isn't counted) and the feeds that still have card
 
 - **Fetches feeds itself.** Zotero's feed reader isn't on the Kindle, so the background task
   (after a sync, at most hourly) fetches each of your Zotero feeds (or those in `settings.json`),
-  the one fetched longest ago first, saving each feed's cards as soon as it is read. It parses RSS 2.0, RSS 1.0 or
+  the one fetched longest ago first, saving each feed's cards as soon as it is read. A run stops
+  itself after about 12 seconds (the app allows 30) and the next one goes on where it stopped, so
+  a long feed list arrives over a few runs; a feed adds at most 50 new cards a run. A feed that
+  doesn't answer rests for an hour, then 2, 4, … up to a day, and the Feeds list says so. It parses RSS 2.0, RSS 1.0 or
   Atom, and adds new entries to that feed's deck in the plugin's storage; the badge says how many are
   new. It parses with [txml](https://www.npmjs.com/package/txml) 6.0.3 (pinned; no dependencies,
   no Node or DOM APIs), bundled into `main.js`.
 - **Fetches `http://` feeds over `https://`** (the app fetches only https), at the same address
   otherwise, and leaves out `utm_*` tracking parameters; the feed keeps its own address as its
   name and identity. A feed that can't be fetched that way, or whose site refuses automated
-  clients (`HTTP 403`, `418`), is skipped and logged once per run.
+  clients (`HTTP 403`, `418`), is skipped, logged and rested the same way.
 - **One deck per feed.** Each feed's undecided cards are kept in a storage key of their own,
   apart from the history (what you decided, Undo, recent collections). A feed keeps at most 150
   undecided cards — over that, its oldest are dropped (not marked decided: they are just gone) —

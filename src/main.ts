@@ -13,7 +13,7 @@
 //   1. State        the history in one zk.storage key, each feed's cards in a key of its own,
 //                   changed only through zk.storage.update (a background refresh can run
 //                   while the user riffles).
-//   2. Background   after a sync, at most hourly: fetch the feeds, parse, mark "in library",
+//   2. Background   after a sync, at most hourly: fetch the feeds (as many as fit in a run), parse,
 //                   add new cards; a badge "N new" on the Plugins icon; zk.ui.refresh().
 //   3. Verdicts     discard, skip, keep, replaceOld, undo: plain async functions on the state.
 //   4. Screens      the deck (main), the filing screen, the feeds, the end of a sitting. Each
@@ -61,7 +61,7 @@ interface Card {
   doi: string | null;
   /** With its version suffix, as the feed gives it (`2401.01234v2`). */
   arxiv: string | null;
-  /** Keys of library items with the same DOI or arXiv id (any version): the replace candidates. */
+  /** Unused since 0.4.1 (looked up when the card is shown); kept so stored cards stay valid. */
   inLibrary: string[];
   /**
    * The feed carries the entry's full text (`content:encoded`, Atom `content`), clearly longer
@@ -98,6 +98,8 @@ interface State {
   fetchedAt: Record<string, number>;
   /** The card Undo brought back: dealt first, whichever feed it is in. */
   top: string | null;
+  /** Feed address → failures in a row, and when it may be fetched again. */
+  failing: Record<string, { times: number; until: number }>;
 }
 
 /** A feed's undecided cards, in dealing order, under `deck:<hash of the feed>`. */
@@ -130,7 +132,7 @@ const LIMITS = {
 const STATE = "state";
 const DECK = "deck:";
 
-const empty = (): State => ({ seen: [], undo: [], recent: [], titles: {}, current: null, fresh: 0, fetchedAt: {}, top: null });
+const empty = (): State => ({ seen: [], undo: [], recent: [], titles: {}, current: null, fresh: 0, fetchedAt: {}, top: null, failing: {} });
 
 function deckKey(feed: string): string {
   return DECK + hash(feed);
@@ -361,50 +363,82 @@ export function fetchUrl(feed: string): string {
 
 // ───────────────────────────── 2. Background: fetch, parse, dedupe ─────────────────────────────
 
-// After a sync, at most hourly, with 30 seconds in all: fetch the feeds, longest-unfetched first
-// (8 s at most each, so one slow host can't eat the run), parse each, drop what is already dealt or decided, mark what
-// is already in the library, and add the rest to the feed's deck. The badge counts what is new since
-// the deck was last opened; zk.ui.refresh() redraws the deck if the user is riffling right now.
+// After a sync, at most hourly. The app gives a run 30 seconds and counts going over as a failure
+// (enough of those turn the plugin off), so a run stops itself well before that: it starts no new
+// feed after RUN.startBy, and the rest come next run. Feeds go longest-unfetched first, each
+// stamped *before* it is fetched, so one that is too slow to finish goes to the back of the queue
+// instead of starting (and stopping) every run. A feed that fails rests for longer each time. Each
+// feed adds at most RUN.perFeed new cards a run; a bigger backlog arrives over the next runs.
+// Whether a card is already in the library is looked up when it's shown, not here.
 zk.background(async () => {
-  const added = await refreshFeeds();
-  if (added > 0) {
-    const fresh = await withState((s) => (s.fresh += added));
+  const run = await refreshFeeds();
+  if (run.added > 0) {
+    const fresh = await withState((s) => (s.fresh += run.added));
     zk.setBadge(`${fresh} new`);
   }
   zk.ui.refresh();
 });
 
+const RUN = {
+  /** No feed is started after this many ms of a run: the slowest feed still ends inside 30 s. */
+  startBy: 12_000,
+  /** One feed's download. */
+  fetchMs: 6_000,
+  /** New cards a feed adds in one run. */
+  perFeed: 50,
+  /** A failing feed rests 1 h, then 2, 4, … up to a day. */
+  restMs: 60 * 60_000,
+  restMaxMs: 24 * 60 * 60_000,
+};
+
+interface RunResult {
+  added: number;
+  /** Feeds read in this run, feeds there are, feeds resting after failures. */
+  done: number;
+  total: number;
+  resting: number;
+}
+
 /**
- * Fetches every feed and adds its new cards to its deck. Resolves how many were added. The feed
- * fetched longest ago goes first, and each feed's cards are saved as soon as it is read: a run cut
- * short by its time limit keeps what it found, and the next run starts where it stopped.
+ * Fetches feeds, longest-unfetched first, until RUN.startBy, and adds their new cards to their
+ * decks. Each feed's cards are saved as soon as it is read; what this run didn't reach, the next
+ * one does.
  */
-async function refreshFeeds(): Promise<number> {
+async function refreshFeeds(): Promise<RunResult> {
+  const began = Date.now();
   const feeds = await feedList();
   const before = await load(); // a snapshot is enough here: the merge below checks again
   const known = new Set([...before.s.seen, ...[...before.decks.values()].flat().map((c) => c.id)]);
-  feeds.sort((a, b) => (before.s.fetchedAt[a] ?? 0) - (before.s.fetchedAt[b] ?? 0));
+  const now = Date.now();
+  const resting = feeds.filter((f) => (before.s.failing[f]?.until ?? 0) > now);
+  const due = feeds.filter((f) => !resting.includes(f));
+  due.sort((a, b) => (before.s.fetchedAt[a] ?? 0) - (before.s.fetchedAt[b] ?? 0));
   // Each feed's share of the storage, so that all decks together stay under the 16 MB.
   const bytes = Math.min(LIMITS.deckBytes, Math.floor(LIMITS.allBytes / Math.max(1, new Set([...feeds, ...before.decks.keys()]).size)));
   let added = 0;
-  for (const url of feeds) {
+  let done = 0;
+  for (const url of due) {
+    if (Date.now() - began > RUN.startBy) break;
+    await withState((s) => {
+      s.fetchedAt[url] = Date.now(); // before: a feed that can't finish goes to the back
+    });
     const fresh: Card[] = [];
     let title: string | null = null;
+    let failed = false;
     const address = fetchUrl(url);
     try {
-      const res = await zk.fetch(address, { timeout: 8000 });
+      const res = await zk.fetch(address, { timeout: RUN.fetchMs });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const feed = parseFeed(await res.text(), url);
       title = feed.title || null;
       for (const card of feed.cards) {
+        if (fresh.length >= RUN.perFeed) break; // the rest next run: they aren't known yet
         if (known.has(card.id)) continue;
         known.add(card.id);
-        card.inLibrary = await inLibrary(card);
         fresh.push(card);
       }
     } catch (e) {
-      // One bad feed shouldn't stop the others. (A LimitError "time" — the whole run's 30 s —
-      // can't be caught: it ends the run; what was saved stays, and the next run goes on.)
+      failed = true;
       console.warn("skipped feed", url, ...(address === url ? [] : [`(fetched as ${address})`]), String(e));
     }
     let kept = 0;
@@ -421,13 +455,17 @@ async function refreshFeeds(): Promise<number> {
       });
     }
     added += kept;
+    done++;
     await withState((s) => {
       if (title) s.titles[url] = title;
-      s.fetchedAt[url] = Date.now();
+      if (failed) {
+        const times = (s.failing[url]?.times ?? 0) + 1;
+        s.failing[url] = { times, until: Date.now() + Math.min(RUN.restMs * 2 ** (times - 1), RUN.restMaxMs) };
+      } else delete s.failing[url];
     });
   }
-  console.log(`${added} new cards`);
-  return added;
+  console.log(`${added} new cards from ${done} of ${feeds.length} feeds (${resting.length} resting)`);
+  return { added, done, total: feeds.length, resting: resting.length };
 }
 
 /**
@@ -523,7 +561,7 @@ async function keep(opts: { cardId?: string; collection?: string | null; tags?: 
     if (opts.collection) {
       s.recent = [opts.collection, ...s.recent.filter((k) => k !== opts.collection)].slice(0, LIMITS.recent);
     }
-    return { card, itemKey: created.key, replaces: card.inLibrary };
+    return { card, itemKey: created.key, replaces: await inLibrary(card) };
   });
   if (!kept) return null;
   await dropFromDeck(kept.card);
@@ -635,7 +673,7 @@ zk.screen("deck", {
     return zk.ui.column([
       header,
       // Swipe left: discard; right: keep. The app turns the card like a page.
-      zk.ui.deck({ id: "card", card: cardBlock(top, !s.current ? feedName(s, top.feed) : null) }),
+      zk.ui.deck({ id: "card", card: cardBlock(top, !s.current ? feedName(s, top.feed) : null, (await inLibrary(top)).length > 0) }),
       // Recent collections: one tap files the card there (the desktop's keys 1–9).
       recent.length > 0 && zk.ui.text("File into", { style: "label" }),
       recent.length > 0 &&
@@ -717,13 +755,13 @@ async function onKeep(): Promise<void> {
   if (top) zk.ui.open("file", { cardId: top.id });
 }
 
-function cardBlock(card: Card, feed: string | null): zk.ui.CardBlock {
+function cardBlock(card: Card, feed: string | null, inLib: boolean): zk.ui.CardBlock {
   const authors = card.authors.length > 3 ? `${card.authors.slice(0, 3).join(", ")} et al.` : card.authors.join(", ");
   return zk.ui.card({
     title: card.title,
     meta: [authors, card.date, feed].filter(Boolean).join(" · "),
     body: card.summary, // plain text; LaTeX stays as source
-    badge: card.inLibrary.length ? "In library" : undefined,
+    badge: inLib ? "In library" : undefined,
   });
 }
 
@@ -791,6 +829,16 @@ async function switchFeed(feed: string): Promise<string> {
 
 let fetched: string | null = null;
 
+/** What Fetch now found: "12 new cards · 14 of 33 feeds, tap again for more · 1 not answering". */
+export function fetchedLine(r: RunResult): string {
+  const cards = r.added ? `${r.added} new card${r.added === 1 ? "" : "s"}` : "Nothing new";
+  const reachable = r.total - r.resting;
+  const parts = [cards];
+  if (r.done < reachable) parts.push(`${r.done} of ${reachable} feeds, tap again for more`);
+  if (r.resting) parts.push(`${r.resting} not answering`);
+  return parts.join(" · ");
+}
+
 zk.screen("feeds", {
   title: "Feeds",
   render: async () => {
@@ -803,7 +851,7 @@ zk.screen("feeds", {
       ...counts.map(({ feed, count }) => ({
         id: feed,
         title: feedName(s, feed),
-        subtitle: hostOf(feed),
+        subtitle: hostOf(feed) + ((s.failing[feed]?.until ?? 0) > Date.now() ? " · not answering, tried again later" : ""),
         meta: `${count}`,
         selected: s.current === feed,
       })),
@@ -817,12 +865,9 @@ zk.screen("feeds", {
   onEvent: async (e) => {
     if (e.kind === "open") fetched = null;
     if (e.kind === "select") zk.ui.close(await switchFeed(e.row));
-    // onEvent has an action's time (30 s and more), enough to fetch every feed while the user
-    // waits; the app shows "Working…" after a second.
-    if (e.kind === "tap" && e.id === "fetch") {
-      const added = await refreshFeeds();
-      fetched = added ? `${added} new card${added === 1 ? "" : "s"}` : "Nothing new";
-    }
+    // onEvent has an action's 30 s; a run stops itself well inside that (the app shows
+    // "Working…" after a second). Tap again for the next feeds.
+    if (e.kind === "tap" && e.id === "fetch") fetched = fetchedLine(await refreshFeeds());
   },
 });
 
@@ -927,7 +972,7 @@ async function startDraft(cardId: string): Promise<Draft | null> {
   if (!card) return null;
   const [collections, tags] = await Promise.all([zk.library.collections(), zk.library.tags()]);
   const old = [];
-  for (const key of card.inLibrary) {
+  for (const key of await inLibrary(card)) {
     const item = await zk.library.item(key);
     if (item) old.push({ key, title: item.title, notes: (await zk.library.notes(key)).length, collections: item.collections });
   }
