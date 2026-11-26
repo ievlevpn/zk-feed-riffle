@@ -192,10 +192,34 @@ declare namespace zk {
     /** The plugin's version from `plugin.json`. */
     readonly version: string;
     /**
-     * Where its `data/` folder is on the device (e.g. `/mnt/us/zotero/plugins/<id>/data`). For
+     * Where its `data/` folder is on the device (e.g. `/mnt/us/zotero/accounts/<userID>/plugins/<id>/data`: the active account's). For
      * telling the user where an export went; files are read and written with {@link zk.files}.
      */
     readonly dataDir: string;
+  };
+
+  /**
+   * The app's window, for a screen that adapts to its size (a Home that drops a large block on a
+   * short screen). Lengths are layout pixels at 300 ppi, the unit the app lays out in, so the same
+   * physical size on every Kindle: a Paperwhite 5 is 1236 × 1547, a Scribe 1860 × 2379, a basic
+   * Kindle (KT4) 1078 × 1337. Read when asked: `landscape` turns with the device (only the reader
+   * turns; the app's screens, Home and plugin screens, are portrait). No permission. Needs app 0.11.0.
+   *
+   * @example
+   * const short = zk.display.height < 1400; // a basic Kindle: keep Home's top compact
+   */
+  const display: {
+    /** The window's width in pixels at 300 ppi. */
+    readonly width: number;
+    /** The window's height (the screen under the status bar), in pixels at 300 ppi. */
+    readonly height: number;
+    /**
+     * The Kindle: `"pw5"`, `"kt4"` or `"scribe"`, else the device's name in lower case without
+     * spaces. The desktop build reports the Kindle it imitates.
+     */
+    readonly model: "pw5" | "kt4" | "scribe" | (string & {});
+    /** Wider than tall. */
+    readonly landscape: boolean;
   };
 
   /**
@@ -618,6 +642,8 @@ declare namespace zk {
      * The text of a downloaded book or paper (PDF, EPUB, …), extracted by the app's own engines.
      * Rejects if the attachment isn't downloaded to the Kindle (see {@link Attachment.downloaded})
      * or isn't a document, or if its text is larger than 32 MB. Can take a few seconds for a long book.
+     * A plugin has at most 4 of these under way at once (plugins take turns on one reader): a fifth
+     * rejects at once; await some before asking for more.
      *
      * Format: an EPUB's paragraphs are separated by a blank line (`"\n\n"`), chapters in reading
      * order. A PDF's pages are in order, separated by a form feed (`"\f"`): `text.split("\f")[0]`
@@ -630,6 +656,41 @@ declare namespace zk {
      * const words = text.split(/\s+/).length;
      */
     function fullText(attachmentKey: string): Promise<string>;
+
+    /**
+     * Opens an item in the app's reader, as if the user had tapped it in the library: its
+     * attachment (the one named by `options.attachment`, else the one the app would open) opens at
+     * the reading place saved on this Kindle, downloading first if needed. Back returns to the
+     * screen as it was, and the screen gets a `{ kind: "reader", closed: true }` event.
+     *
+     * Only in answer to the user (a screen's `onEvent`, an action's `run`), like
+     * {@link zk.reader.open}; from a background task or a timer it throws, and nothing opens. The
+     * promise resolves when the reader shows, and rejects with the reason when it can't: the item
+     * is gone or unreadable (`"Item not found"`), the download failed, or the user cancelled it
+     * (`"Cancelled"`). An unknown key never opens anything. Given as `{ key, library }`, the key is
+     * looked up in that library; with `library` omitted (or a plain key) the app finds the item
+     * by its key across the libraries it shows.
+     *
+     * With `annotation` (an {@link Annotation}'s key, needs app 0.11.0) the reader opens the file
+     * that annotation is in and goes to it, as a tap in the app's Notes does. An annotation that
+     * is unknown, deleted, another item's, or not in the `attachment` given rejects with
+     * `"Annotation not found"`; on an app before 0.11.0 the option is ignored and the item opens
+     * where it was left.
+     *
+     * **Permission**: `library:read`. Needs app 0.10.0.
+     *
+     * @example
+     * if (e.kind === "tap" && e.id === "continue") await zk.library.open(lastKey);
+     * @example
+     * await zk.library.open({ key: item.key, library: item.libraryId }, { attachment: pdf.key });
+     * @example
+     * // a highlight, tapped: the reader opens at it (app 0.11.0)
+     * await zk.library.open(passage.itemKey, { annotation: passage.key });
+     */
+    function open(
+      item: string | { key: string; library?: number },
+      options?: { attachment?: string; annotation?: string },
+    ): Promise<void>;
   }
 
   /** Filters for {@link zk.library.items}. They combine: an item must match all that are given. */
@@ -642,6 +703,19 @@ declare namespace zk {
     library?: number;
     /** Stop after this many items. */
     limit?: number;
+    /**
+     * `true`: only items opened on this Kindle, the most recently opened first (the order of the
+     * app's Recent list). Needs app 0.10.0.
+     *
+     * @example
+     * for await (const item of zk.library.items({ opened: true, limit: 5 })) console.log(item.title, item.progress);
+     */
+    opened?: true;
+    /**
+     * Only items marked read (`true`) or not marked read (`false`): the read mark, never
+     * progress. Needs app 0.10.0.
+     */
+    read?: boolean;
   }
 
   // ───────────────────────────── Changing the library ─────────────────────────────
@@ -1138,6 +1212,34 @@ declare namespace zk {
   interface ScreenSpec<P = undefined> {
     /** Shown in the header (with the plugin's name), and in the launcher for a main screen. Short. */
     title: string;
+    /**
+     * Offer this screen as the body of the app's Home (Settings → Home lists it as
+     * "<title> — <plugin name>"; the user picks one). Default `false`. Needs app 0.10.0.
+     *
+     * The app keeps Home's frame: the title and sync line, the Plugins, settings, sync and close
+     * icons, the search field, the error, safe-mode and update banners, and the tab bar. The screen
+     * draws only the body between the search field and the banners/tab bar, and its `render` takes
+     * no params. The body may hold every block except {@link zk.ui.search} and {@link zk.ui.field};
+     * a tree with one is invalid for Home.
+     *
+     * Home falls back to the app's built-in body, with no message, when plugins are off (safe mode,
+     * stopped for an install), the chosen plugin is disabled, removed or incompatible or has no such
+     * screen, no tree has been drawn yet and the first one doesn't arrive within 1 s (the last tree
+     * is kept and drawn first on the next start), or `render`/`onEvent` fails. The next time Home
+     * shows, the plugin is tried again. A periodic sync that changes nothing repaints nothing.
+     *
+     * @example
+     * zk.screen("home", {
+     *   title: "Reading now",
+     *   home: true,
+     *   render: async () => {
+     *     const keys: string[] = [];
+     *     for await (const i of zk.library.items({ opened: true, limit: 3 })) keys.push(i.key);
+     *     return zk.ui.column([zk.ui.items({ id: "recent", style: "card", items: keys, empty: "Nothing opened yet" })]);
+     *   },
+     * });
+     */
+    home?: boolean;
     /** List this screen in the Plugins launcher (opened there with no params). Default `false`. */
     main?: boolean;
     /**
@@ -1175,16 +1277,20 @@ declare namespace zk {
      * @example
      * zk.ui.column([zk.ui.text("Feeds", { style: "title" }), feedList], { gap: "medium" });
      */
-    function column(children: Child[], opts?: { gap?: Gap }): ColumnBlock;
+    function column(children: Child[], opts?: { gap?: Gap; fit?: "page" | "trim"; width?: Width }): ColumnBlock;
 
     /**
-     * Places blocks side by side, sharing the width (e.g. a label and a button). Wraps nothing:
-     * keep it to two or three short blocks.
+     * Places blocks side by side (e.g. a label and a button), up to 12. Wraps nothing: keep it
+     * to a few short blocks. Each child takes what its `width` says (see {@link Width}); the
+     * rest of the width is shared equally by the children that `fill` (the default; buttons are
+     * `"auto"`). `align` places the children vertically when they differ in height (centred unless
+     * it says, as before 0.12); with `"stretch"` each is as tall as the row, and a {@link spacer} in a stretched column takes
+     * the leftover height. `align` and the 12 blocks need app 0.12.0 (older apps: 6 blocks).
      *
      * @example
      * zk.ui.row([zk.ui.text("math.PR · 12 left", { style: "label" }), zk.ui.button({ id: "feeds", title: "Feeds" })]);
      */
-    function row(children: Child[], opts?: { gap?: Gap }): RowBlock;
+    function row(children: Child[], opts?: { gap?: Gap; align?: RowAlign; width?: Width }): RowBlock;
 
     /**
      * Text in one of four styles; `"\n"` breaks a line. `spans` mark bold and italic stretches.
@@ -1194,7 +1300,7 @@ declare namespace zk {
      * zk.ui.text("Gaussian random fields", { style: "title", lines: 2 });
      * zk.ui.text(["Filed into ", { text: "Probability / SPDEs", bold: true }], { style: "meta" });
      */
-    function text(text: string | Span[], opts?: { style?: TextStyle; lines?: number }): TextBlock;
+    function text(text: string | Span[], opts?: TextOptions): TextBlock;
 
     /**
      * A card: title, a meta line, a body (paged with up/down swipes when long), and a badge
@@ -1223,6 +1329,29 @@ declare namespace zk {
      * zk.ui.deck({ id: "cards", card: top && zk.ui.card({ title: top.title }), empty: "Nothing left to riffle" });
      */
     function deck(deck: Omit<DeckBlock, "kind">): DeckBlock;
+
+    /**
+     * Library items drawn by the app: a `card` (title, authors, progress) or a `row` per item, or
+     * a `shelf` of cover tiles, paged like the app's lists. The app resolves the keys itself, so the rows always show the
+     * item's current title and reading progress, and repaints just this block when they change.
+     * Items that are missing, in a switched-off group or unreadable are skipped silently; if all
+     * are, `empty` shows (none: the block draws nothing).
+     *
+     * **Taps and long-presses never reach the plugin**: a tap opens the item in the reader (the
+     * screen then gets a `{ kind: "reader", closed: true }` event when it closes), a long-press
+     * shows the library's own item menu. Use {@link zk.library.open} to open one in answer to
+     * your own button. Reading the items needs `library:read`. Needs app 0.10.0.
+     *
+     * @example
+     * zk.ui.items({ id: "recent", style: "row", items: keys, empty: "Nothing opened yet" });
+     * @example
+     * // an item from a group library, with its own label
+     * zk.ui.items({ id: "pick", style: "card", items: [{ key: "ABCD2345", library: 12, label: "Up next" }] });
+     * @example
+     * // the books being read, as covers (needs app 0.11.0)
+     * zk.ui.items({ id: "shelf", style: "shelf", items: reading.map((i) => i.key), empty: "Nothing on the shelf" });
+     */
+    function items(items: Omit<ItemsBlock, "kind">): ItemsBlock;
 
     /**
      * Rows the user picks from, paged like the app's lists; tapping a row sends a `select`
@@ -1310,6 +1439,91 @@ declare namespace zk {
      */
     function notice(text: string, opts?: { id?: string }): NoticeBlock;
 
+    /**
+     * A passage set apart: its text in italics with a rule on its left, at most 5 lines (a longer
+     * one ends with "…"), and its `source` on a line under it. With an `id`, tapping it sends a
+     * `tap` event with that id (open the highlight with {@link zk.library.open}'s `annotation`).
+     * Line breaks in `text` are kept; spaces around it are not. May be on Home's body. Needs app
+     * 0.11.0.
+     *
+     * @example
+     * zk.ui.quote({ text: "It is a truth universally acknowledged…", source: "Pride and Prejudice · p. 1" });
+     * @example
+     * zk.ui.quote({ id: "passage", text: a.text ?? "", source: `${item.title} · p. ${a.pageLabel}` });
+     * // onEvent: if (e.kind === "tap" && e.id === "passage") await zk.library.open(item.key, { annotation: a.key });
+     */
+    function quote(quote: { id?: string; text: string; source?: string }): QuoteBlock;
+
+    /**
+     * Flexible empty space: in a column that is as tall as its row (a row with `align:
+     * "stretch"`) it takes the height the other children leave; anywhere else it takes no room.
+     * Needs app 0.12.0.
+     *
+     * @example
+     * zk.ui.row([cover, zk.ui.column([title, zk.ui.spacer(), zk.ui.progress(0.4)])], { align: "stretch" });
+     */
+    function spacer(): SpacerBlock;
+
+    /**
+     * A frame around one block: padding, a border, a fill, rounded corners. Text inside an `"ink"`
+     * box is drawn white unless its own `tone` says otherwise. With an `id`, tapping it sends a
+     * `tap` event with that id: the way to make a custom button, a link, a segmented switch.
+     * Needs app 0.12.0.
+     *
+     * @example
+     * zk.ui.box(zk.ui.text("Week", { tone: "inverse" }), { id: "week", pad: "small", fill: "ink", radius: "round" });
+     */
+    function box(child: Block, opts?: { id?: string; pad?: Gap; border?: Border; fill?: Fill; radius?: Radius; width?: Width }): BoxBlock;
+
+    /**
+     * An item's cover as the app draws it, 2:3, as wide as `width` says (default `"fill"`).
+     * Needs app 0.12.0.
+     *
+     * @example
+     * zk.ui.cover(book.key, { width: "25%" });
+     */
+    function cover(item: ItemRef, opts?: { width?: Width }): CoverBlock;
+
+    /**
+     * The app's thin progress bar, `value` from 0 to 1. Needs app 0.12.0.
+     *
+     * @example
+     * zk.ui.progress(0.4);
+     */
+    function progress(value: number, opts?: { width?: Width }): ProgressBlock;
+
+    /**
+     * Makes any block an item: a tap opens it as the app opens items (download, the choice of a
+     * file, the reader), a long press shows its item sheet, and while it downloads the app draws
+     * the status in a small bar over the bottom of the block. An item that can't be read: the
+     * block is drawn but does nothing. Needs app 0.12.0.
+     *
+     * @example
+     * zk.ui.item(book.key, zk.ui.row([zk.ui.cover(book.key, { width: "20%" }), zk.ui.text(book.title)]));
+     */
+    function item(item: ItemRef, child: Block): ItemBlock;
+
+    /**
+     * Cells in rows. `columns`: a number from 1 to 12, or `"auto"` (the default): as many as fit
+     * with each at least `minWidth` (5% to 100% of the grid, default `"25%"`). It pages by rows
+     * like the app's lists, unless `rows` (1 to 20) is given: then only that many rows are drawn,
+     * the rest are not, and it never pages. Needs app 0.12.0.
+     *
+     * @example
+     * zk.ui.grid(books.map((b) => zk.ui.item(b.key, zk.ui.cover(b.key))), { columns: 4, rows: 1 });
+     */
+    function grid(children: Child[], opts?: { columns?: number | "auto"; minWidth?: Percent; gap?: Gap; rows?: number; width?: Width }): GridBlock;
+
+    /**
+     * A PNG from the plugin's package, drawn in greys with its aspect kept. `src` is a path in
+     * the package (never absolute, never with `..`). With an `id` it is tappable. Needs app
+     * 0.12.0.
+     *
+     * @example
+     * zk.ui.image({ src: "images/logo.png", width: "40%" });
+     */
+    function image(image: { src: string; width?: Width; id?: string }): ImageBlock;
+
     // ── Navigation ──
 
     /**
@@ -1355,6 +1569,7 @@ declare namespace zk {
       | TextBlock
       | CardBlock
       | DeckBlock
+      | ItemsBlock
       | ListBlock
       | SearchBlock
       | FieldBlock
@@ -1363,7 +1578,15 @@ declare namespace zk {
       | ButtonsBlock
       | DividerBlock
       | SpaceBlock
-      | NoticeBlock;
+      | NoticeBlock
+      | QuoteBlock
+      | SpacerBlock
+      | BoxBlock
+      | CoverBlock
+      | ProgressBlock
+      | ItemBlock
+      | GridBlock
+      | ImageBlock;
 
     /** A child of a layout block, or a falsy value to skip (so `cond && block` works). */
     type Child = Block | Falsy;
@@ -1372,7 +1595,55 @@ declare namespace zk {
     type Falsy = null | undefined | false | "" | 0;
 
     /** Spacing between children. */
-    type Gap = "none" | "small" | "medium" | "large";
+    type Gap = "none" | "xsmall" | "small" | "medium" | "large";
+
+    /** A whole percentage from `"1%"` to `"100%"`. */
+    type Percent = `${number}%`;
+
+    /**
+     * How wide a block is, for any block (it matters in a {@link row}, and for a cover, a
+     * progress bar or an image anywhere): `"fill"` shares what the siblings leave, `"auto"` is
+     * its natural width (a text's, a button's), `"<n>%"` is that share of the row's width.
+     * However long an `"auto"` sibling, a `"fill"` keeps at least 120 px (or an equal share of a
+     * narrow row) and a percent as much of that as it asks for: the long text wraps instead.
+     * Needs app 0.12.0.
+     */
+    type Width = "fill" | "auto" | Percent;
+
+    /** Where a row's children sit vertically; `"stretch"` makes each as tall as the row. */
+    type RowAlign = "top" | "center" | "bottom" | "stretch";
+
+    /** A {@link box}'s border: none, a hairline or a heavy line. */
+    type Border = "none" | "thin" | "thick";
+
+    /** A {@link box}'s fill: none, a light grey, or ink (text inside is white). */
+    type Fill = "none" | "light" | "ink";
+
+    /** A {@link box}'s corners. */
+    type Radius = "none" | "small" | "round";
+
+    /** Options of {@link text}. Needs app 0.12.0 except `style` and `lines`. */
+    interface TextOptions {
+      /** A preset of font, size, weight and tone; the options below override it. Default `"body"`. */
+      style?: TextStyle;
+      /** At most this many lines, ending with "…". */
+      lines?: number;
+      font?: "serif" | "sans";
+      size?: "xsmall" | "small" | "body" | "large" | "title";
+      weight?: "regular" | "medium" | "bold";
+      /** `"inverse"` is white. Unset inside an `"ink"` box: white; elsewhere the style's. */
+      tone?: "ink" | "secondary" | "inverse";
+      italic?: boolean;
+      /** Uppercase and spaced out: a section label. */
+      caps?: boolean;
+      /** Where its lines sit in its width. Default `"start"`. */
+      align?: "start" | "center" | "end";
+      /** Makes it tappable (a link): a tap sends a `tap` event with this id. */
+      id?: string;
+      /** Typeset inline (`$…$`, `\(…\)`) and display (`$$…$$`, `\[…\]`) LaTeX math on-device via MicroTeX. */
+      math?: boolean;
+      width?: Width;
+    }
 
     /** A size of {@link space}. */
     type Size = "small" | "medium" | "large";
@@ -1389,24 +1660,33 @@ declare namespace zk {
       children: Child[];
       /** Default `"small"`. */
       gap?: Gap;
+      /**
+       * Only on the root of a Home body (a screen, or a column inside, refuses it). `"page"`
+       * (default): what doesn't fit is paged. `"trim"`: the children in order while they fit;
+       * the first that doesn't is trimmed if it can be (a grid to the rows that fit, a column to
+       * its children that fit, recursively) and dropped otherwise; everything after it is
+       * dropped; never a pager. Needs app 0.12.0.
+       */
+      fit?: "page" | "trim";
+      width?: Width;
     }
 
     /** See {@link row}. */
     interface RowBlock {
       kind: "row";
+      /** At most 12 (6 before app 0.12.0). */
       children: Child[];
       /** Default `"small"`. */
       gap?: Gap;
+      /** Default `"center"` (as rows were before 0.12). Needs app 0.12.0. */
+      align?: RowAlign;
+      width?: Width;
     }
 
     /** See {@link text}. */
-    interface TextBlock {
+    interface TextBlock extends TextOptions {
       kind: "text";
       text: string | Span[];
-      /** Default `"body"`. */
-      style?: TextStyle;
-      /** At most this many lines, ending with "…". */
-      lines?: number;
     }
 
     /** See {@link card}. */
@@ -1419,6 +1699,8 @@ declare namespace zk {
       body?: string;
       /** A short mark in the card's corner. */
       badge?: string;
+      /** Typeset inline (`$…$`, `\(…\)`) and display (`$$…$$`, `\[…\]`) LaTeX math in title and body via MicroTeX. */
+      math?: boolean;
     }
 
     /** See {@link deck}. */
@@ -1428,6 +1710,39 @@ declare namespace zk {
       /** The card on top; `null` (or absent) when there is none. */
       card?: CardBlock | null;
       /** Shown when there is no card. */
+      empty?: string;
+    }
+
+    /** An item for an {@link items} block: its key, or the key with its library and a label. */
+    type ItemRef = string | {
+      key: string;
+      /** 0 My Library, else a group's id ({@link zk.library.libraries}). Omitted: the app finds the item by its key across the libraries it shows. */
+      library?: number;
+      /** The kicker line above a `card`'s title (e.g. "BOOK · CONTINUE"); a `row` ignores it. */
+      label?: string;
+    };
+
+    /** See {@link items}. */
+    interface ItemsBlock {
+      kind: "items";
+      id: string;
+      /**
+       * `"card"`: a large entry per item; `"row"`: a compact line per item; `"shelf"`: cover tiles
+       * in rows.
+       *
+       * A shelf's tile is the item's cover as the app draws it (a book in one of three
+       * looks chosen by its key; a paper like a first page; no corner tab; from app 0.12.0), a thin progress bar
+       * once it was opened, and one line under it: "13%", "New" or "Read", or the download's
+       * progress while it downloads. The tiles per row follow the screen's width (4 on a
+       * Paperwhite or a Kindle, 6 on a Scribe), and the shelf pages a row at a time. A ref's
+       * `label` isn't shown on a shelf. `"shelf"` needs app 0.11.0 (older apps refuse the tree).
+       *
+       * @example
+       * zk.ui.items({ id: "shelf", style: "shelf", items: keys });
+       */
+      style: "card" | "row" | "shelf";
+      items: ItemRef[];
+      /** Shown when none of the items can be read. */
       empty?: string;
     }
 
@@ -1534,6 +1849,89 @@ declare namespace zk {
       id?: string;
     }
 
+    /** See {@link quote}. Needs app 0.11.0. */
+    interface QuoteBlock {
+      kind: "quote";
+      /** The passage: at most 5 lines show. */
+      text: string;
+      /** Where it is from, on one line under it (`"Pride and Prejudice · p. 1"`). */
+      source?: string;
+      /** Makes it tappable: a tap sends a `tap` event with this id. */
+      id?: string;
+    }
+
+    /** See {@link spacer}. Needs app 0.12.0. */
+    interface SpacerBlock {
+      kind: "spacer";
+      width?: Width;
+    }
+
+    /** See {@link box}. Needs app 0.12.0. */
+    interface BoxBlock {
+      kind: "box";
+      child: Block;
+      /** Makes it tappable: a tap sends a `tap` event with this id. */
+      id?: string;
+      /** Space between the frame and the child. Default `"none"`. */
+      pad?: Gap;
+      /** Default `"none"`. */
+      border?: Border;
+      /** Default `"none"`. */
+      fill?: Fill;
+      /** Default `"none"`. */
+      radius?: Radius;
+      width?: Width;
+    }
+
+    /** See {@link cover}. Needs app 0.12.0. */
+    interface CoverBlock {
+      kind: "cover";
+      item: ItemRef;
+      /** Default `"fill"`. */
+      width?: Width;
+    }
+
+    /** See {@link progress}. Needs app 0.12.0. */
+    interface ProgressBlock {
+      kind: "progress";
+      /** From 0 to 1. */
+      value: number;
+      width?: Width;
+    }
+
+    /** See {@link item}. Needs app 0.12.0. */
+    interface ItemBlock {
+      kind: "item";
+      item: ItemRef;
+      child: Block;
+      width?: Width;
+    }
+
+    /** See {@link grid}. Needs app 0.12.0. */
+    interface GridBlock {
+      kind: "grid";
+      children: Child[];
+      /** 1 to 12, or `"auto"` (default). */
+      columns?: number | "auto";
+      /** With `"auto"` columns, the narrowest a cell gets: `"5%"` to `"100%"`, default `"25%"`. */
+      minWidth?: Percent;
+      /** Default `"small"`. */
+      gap?: Gap;
+      /** 1 to 20: draw only this many rows, never page. */
+      rows?: number;
+      width?: Width;
+    }
+
+    /** See {@link image}. Needs app 0.12.0. */
+    interface ImageBlock {
+      kind: "image";
+      /** A path in the plugin's package: not absolute, no `..`. */
+      src: string;
+      width?: Width;
+      /** Makes it tappable: a tap sends a `tap` event with this id. */
+      id?: string;
+    }
+
     /**
      * What `onEvent` receives. Events arrive one at a time, in the order they happened; a
      * pending `change` (typing not yet sent) is always sent before any other event of the same
@@ -1542,7 +1940,8 @@ declare namespace zk {
      * - `open` — the screen is opening; first, before its first render ("Loading…" shows until
      *   it returns). For set-up slower than `render`'s 1 s.
      * - `tap` — a {@link button}, or one of {@link buttons}, by its `id`; the {@link deck}'s card,
-     *   by the deck's `id`; a {@link notice} with an `id` (the last two need app 0.9.0).
+     *   by the deck's `id`; a {@link notice} with an `id` (the last two need app 0.9.0); a
+     *   {@link quote} with an `id` (app 0.11.0); a {@link box}, an {@link image} or a {@link text} with an `id` (app 0.12.0).
      * - `select` — a {@link list} row: `id` is the list's, `row` the row's.
      * - `swipe` — the {@link deck}'s card, left or right.
      * - `change` / `submit` — a {@link search} or {@link field}: its whole text.
@@ -1552,7 +1951,8 @@ declare namespace zk {
      *   (`undefined` if closed with Back or without a result).
      * - `back` — the user left this screen. It is already closed; nothing is rendered after.
      * - `reader` — a preview this screen opened with {@link zk.reader.open} closed (`closed:
-     *   true`): the screen shows again as it was. Needs app 0.9.0.
+     *   true`): the screen shows again as it was. Needs app 0.9.0. Also sent (app 0.10.0) when an
+     *   item opened from an {@link items} block or with {@link zk.library.open} closes.
      *
      * @example
      * onEvent: async (e) => {
@@ -1571,7 +1971,14 @@ declare namespace zk {
       | { kind: "chips"; id: string; chip: string; selected: string[] }
       | { kind: "result"; from: string; value: Json | undefined }
       | { kind: "back" }
-      | { kind: "reader"; closed: true };
+      | {
+          kind: "reader";
+          closed: true;
+          /** Present when `zk.reader.open` was called with `save: true` or `save: "prompt"`. */
+          action?: "save" | "discard" | "close";
+          /** Temporary highlights/underlines made during a saveable preview (non-empty when annotated). */
+          annotations?: zk.reader.PreviewAnnotation[];
+        };
   }
 
   // ───────────────────────────── The reader ─────────────────────────────
@@ -1580,6 +1987,16 @@ declare namespace zk {
    * The app's reader, for documents that aren't in the library. Needs app 0.9.0.
    */
   namespace reader {
+    /** A temporary highlight or underline made while reading a preview opened with `save`. */
+    interface PreviewAnnotation {
+      type: "highlight" | "underline";
+      text: string;
+      comment?: string;
+      color: string;
+      pageLabel?: string;
+      tags?: string[];
+    }
+
     /**
      * Opens a document in the app's reader as a **preview**: nothing is added to the library.
      *
@@ -1590,8 +2007,12 @@ declare namespace zk {
      * - `html`: a page the plugin already has (an article it extracted), opened like a saved web
      *   page. No scripts run; images aren't fetched (`data:` URLs show). `baseUrl` resolves its
      *   relative links.
+     * - `save`: `true` enables temporary highlighting/notes in Preview, adds a **Save** button to
+     *   the reader menu, and asks *Save or Discard?* on Back when annotations exist; `"prompt"`
+     *   always asks *Save or Discard?* on Back. The screen's `reader` close event then carries
+     *   `action` (`"save" | "discard" | "close"`) and `annotations`.
      *
-     * In a preview there is no highlighting, notes or bookmarks: a selection offers Search and
+     * Without `save`, there is no highlighting, notes or bookmarks: a selection offers Search and
      * plugin actions (their {@link TextSelection} has `item: null` and `preview`). The top bar says
      * "Preview". Nothing syncs. The app keeps the last 10 previewed documents (at most 100 MB) with
      * their reading places, so opening one again is instant.
@@ -1603,11 +2024,15 @@ declare namespace zk {
      * was, and the screen gets a `{ kind: "reader", closed: true }` event.
      *
      * @example
-     * if (e.kind === "tap" && e.id === "card") await zk.reader.open({ url: `https://arxiv.org/pdf/${card.arxiv}`, title: card.title });
+     * if (e.kind === "tap" && e.id === "card") await zk.reader.open({ url: `https://arxiv.org/pdf/${card.arxiv}`, title: card.title, save: "prompt" });
      * @example
-     * await zk.reader.open({ html: article, title: card.title, baseUrl: card.link });
+     * await zk.reader.open({ html: article, title: card.title, baseUrl: card.link, save: true });
      */
-    function open(doc: { url: string; title?: string } | { html: string; title: string; baseUrl?: string }): Promise<void>;
+    function open(
+      doc:
+        | { url: string; title?: string; save?: boolean | "prompt" }
+        | { html: string; title: string; baseUrl?: string; save?: boolean | "prompt" },
+    ): Promise<void>;
   }
 
   // ───────────────────────────── Data ─────────────────────────────
@@ -1644,6 +2069,18 @@ declare namespace zk {
     collections: string[];
     /** Whether it is marked read. */
     read: boolean;
+    /**
+     * How far the item was read on this Kindle (its current place in the attachment), 0…1;
+     * `null` if it was never opened here. Not synced, and not the read mark (`read`). Needs app
+     * 0.10.0.
+     */
+    progress: number | null;
+    /** When the user last opened it on this Kindle (ISO 8601), `null` if never. Needs app 0.10.0. */
+    openedAt: string | null;
+    /** When it was added to Zotero (its `dateAdded`, ISO 8601). Needs app 0.10.0. */
+    addedAt: string;
+    /** The format of the attachment the app opens: `null` if it has none it can read. Needs app 0.10.0. */
+    format: "EPUB" | "PDF" | "WEB" | null;
     /** Zotero's *Extra* field. */
     extra: string | null;
     /**

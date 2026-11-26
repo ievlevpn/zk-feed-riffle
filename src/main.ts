@@ -542,7 +542,15 @@ async function skip(): Promise<Card | undefined> {
  * note. `cardId` defaults to the top card. Resolves with the new item's key and the old items the
  * user may want to replace ({@link replaceOld}), or `null` if the card is gone.
  */
-async function keep(opts: { cardId?: string; collection?: string | null; tags?: string[]; note?: string } = {}) {
+async function keep(
+  opts: {
+    cardId?: string;
+    collection?: string | null;
+    tags?: string[];
+    note?: string;
+    previewAnnotations?: zk.reader.PreviewAnnotation[];
+  } = {},
+) {
   const kept = await withState(async (s) => {
     const card = findCard(await viewOf(s), opts.cardId);
     if (!card) return null;
@@ -554,7 +562,12 @@ async function keep(opts: { cardId?: string; collection?: string | null; tags?: 
       tags,
     });
     // The note is a second change, on the new item: withdrawing the item withdraws it too.
-    if (opts.note?.trim()) await zk.zotero.addNote(created.key, `<p>${escapeHtml(opts.note.trim())}</p>`);
+    const noteParts: string[] = [];
+    if (opts.note?.trim()) noteParts.push(`<p>${escapeHtml(opts.note.trim())}</p>`);
+    if (opts.previewAnnotations && opts.previewAnnotations.length > 0) {
+      noteParts.push(formatPreviewAnnotations(opts.previewAnnotations));
+    }
+    if (noteParts.length > 0) await zk.zotero.addNote(created.key, noteParts.join("\n"));
 
     s.seen.push(card.id);
     s.undo.push({ kind: "keep", card, itemKey: created.key, changes: [{ kind: "createItem", ...created }] });
@@ -708,9 +721,9 @@ zk.screen("deck", {
       case "swipe":
         return e.direction === "left" ? onDiscard() : onKeep();
       case "tap":
-        // The card: read its paper, deciding nothing (the card stays on top).
-        if (e.id === "card") return onRead(cardsIn(await load())[0]);
-        if (e.id === "kept") return onRead(keptCard ?? undefined);
+        // The card: read its paper in Preview (with highlights & Save/Discard prompt on Back).
+        if (e.id === "card") return onRead(cardsIn(await load())[0], true);
+        if (e.id === "kept") return onRead(keptCard ?? undefined, false);
         if (e.id === "discard") return onDiscard();
         if (e.id === "keep") return onKeep();
         if (e.id === "skip") {
@@ -738,8 +751,18 @@ zk.screen("deck", {
         keptCard = justFiled;
         justFiled = null;
         return;
-      case "reader": // back from reading: the screen is as it was
+      case "reader": {
+        const cardId = readingCardId;
+        readingCardId = null;
+        if (!cardId) return;
+        if (e.action === "discard") {
+          await onDiscard();
+        } else if (e.action === "save") {
+          pendingPreviewAnnotations = e.annotations ?? [];
+          zk.ui.open("file", { cardId });
+        }
         return;
+      }
     }
   },
 });
@@ -752,6 +775,7 @@ async function onDiscard(): Promise<void> {
 /** Keep opens the filing screen for the top card; it closes with a line for the notice. */
 async function onKeep(): Promise<void> {
   const top = cardsIn(await load())[0];
+  pendingPreviewAnnotations = [];
   if (top) zk.ui.open("file", { cardId: top.id });
 }
 
@@ -760,8 +784,9 @@ function cardBlock(card: Card, feed: string | null, inLib: boolean): zk.ui.CardB
   return zk.ui.card({
     title: card.title,
     meta: [authors, card.date, feed].filter(Boolean).join(" · "),
-    body: card.summary, // plain text; LaTeX stays as source
+    body: card.summary,
     badge: inLib ? "In library" : undefined,
+    math: true,
   });
 }
 
@@ -888,10 +913,13 @@ interface Draft {
   tags: string[];
   tagText: string;
   note: string;
+  previewAnnotations: zk.reader.PreviewAnnotation[];
   replace: boolean;
 }
 
 let draft: Draft | null = null;
+let readingCardId: string | null = null;
+let pendingPreviewAnnotations: zk.reader.PreviewAnnotation[] = [];
 
 zk.screen<{ cardId: string }>("file", {
   title: "Keep",
@@ -904,7 +932,7 @@ zk.screen<{ cardId: string }>("file", {
       ? d.libraryTags.filter((t) => !d.tags.includes(t) && t.toLowerCase().includes(d.tagText.toLowerCase())).slice(0, 8)
       : [];
     return zk.ui.column([
-      zk.ui.text(d.card.title, { style: "title", lines: 2 }),
+      zk.ui.text(d.card.title, { style: "title", lines: 2, math: true }),
       d.old.length > 0 &&
         zk.ui.notice(`Already in your library — filing adds a second item. The old one holds ${notes} note${notes === 1 ? "" : "s"}.`),
       // A one-chip set reads as a switch: on, the old copy goes to the trash (after the app asks).
@@ -922,6 +950,10 @@ zk.screen<{ cardId: string }>("file", {
         zk.ui.chips({ id: "tags", chips: [...d.tags, ...suggestions], selected: d.tags }),
       zk.ui.field({ id: "tag", placeholder: "Add a tag", value: d.tagText }),
       zk.ui.field({ id: "note", label: "Note", lines: 3 }),
+      d.previewAnnotations.length > 0 &&
+        zk.ui.notice(
+          `${d.previewAnnotations.length} preview highlight${d.previewAnnotations.length === 1 ? "" : "s"} will be attached as a note.`,
+        ),
       zk.ui.button({ id: "file", title: chosen ? `File into ${chosen.name}` : "Keep (no collection)", primary: true }),
     ]);
   },
@@ -987,6 +1019,7 @@ async function startDraft(cardId: string): Promise<Draft | null> {
     tags: [],
     tagText: "",
     note: "",
+    previewAnnotations: pendingPreviewAnnotations.splice(0),
     replace: false,
   };
 }
@@ -1014,11 +1047,20 @@ function collectionRows(d: Draft): zk.ui.ListRow[] {
 /** Keeps the card as drafted; replaces the old copy if asked. Resolves a line for the deck. */
 async function fileDraft(d: Draft): Promise<string> {
   draft = null;
-  const kept = await keep({ cardId: d.card.id, collection: d.collection, tags: d.tags, note: d.note });
+  const kept = await keep({
+    cardId: d.card.id,
+    collection: d.collection,
+    tags: d.tags,
+    note: d.note,
+    previewAnnotations: d.previewAnnotations,
+  });
   if (!kept) return "That card is no longer in the deck";
   justFiled = d.card;
   const where = d.collections.find((c) => c.key === d.collection)?.name;
   let line = where ? `Kept into ${where}` : "Kept";
+  if (d.previewAnnotations.length > 0) {
+    line += ` (${d.previewAnnotations.length} highlight${d.previewAnnotations.length === 1 ? "" : "s"})`;
+  }
   if (d.replace && kept.replaces.length) {
     // The app asks the user, in its own confirmation; the screen waits, and the wait doesn't
     // count against onEvent's time.
@@ -1058,7 +1100,8 @@ function toCard(entry: TNode, feed: string): Card {
   const arxiv = ids.match(/arxiv\.org\/abs\/([^\s?#]+)|oai:arXiv\.org:(\S+)|arXiv:(\d{4}\.\d{4,5}(?:v\d+)?)/i)?.slice(1).find(Boolean) ?? null;
   const doi = (text(child(entry, "prism:doi") ?? child(entry, "arxiv:doi")) || ids.match(/\b10\.\d{4,9}\/\S+/)?.[0]) ?? null;
   const date = text(child(entry, "pubDate") ?? child(entry, "published") ?? child(entry, "dc:date") ?? child(entry, "updated"));
-  const summary = oneLine(stripTags(text(child(entry, "description") ?? child(entry, "summary") ?? child(entry, "content"))));
+  const rawSummary = text(child(entry, "description") ?? child(entry, "summary") ?? child(entry, "content"));
+  const summary = cleanSummary(rawSummary);
   return {
     id: arxiv ? `arxiv:${arxiv}` : doi ? `doi:${doi.toLowerCase()}` : guid || link || text(child(entry, "title")),
     feed,
@@ -1131,11 +1174,29 @@ function authorsOf(entry: TNode): string[] {
 }
 
 /**
- * Markup out, crudely. (The desktop Feed Riffle renders feed HTML through a sanitizer and is
- * careful not to read `$1<p<\infty$` as a tag; on the Kindle a card shows plain text.)
+ * Strips genuine HTML tags while protecting LaTeX math spans (`$$…$$`, `\[…\]`, `\(…\)`, `$…$`)
+ * so inequalities like `$1<p<\infty$` are never mistaken for HTML tags.
  */
 function stripTags(html: string): string {
-  return html.replace(/<\/?[a-zA-Z][^>]*>/g, "");
+  const saved: string[] = [];
+  const masked = html.replace(/\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\)|\$(?!\s)(?:\\.|[^$\\])*?(?<!\s)\$/g, (m) => {
+    saved.push(m);
+    return `\uE000${saved.length - 1}\uE001`;
+  });
+  const plain = masked
+    .replace(/<\/?(?:p|div|li|blockquote|h[1-6])\b[^>]*>/gi, "\n\n")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/?[a-zA-Z][a-zA-Z0-9:-]*(?:\s[^<>]*?)?>/g, "");
+  return plain.replace(/\uE000(\d+)\uE001/g, (_, idx) => saved[Number(idx)] ?? "");
+}
+
+function cleanSummary(raw: string): string {
+  const stripped = stripTags(raw).trimStart().replace(/^arXiv:\S+\s+Announce Type:\s*\S+\s+Abstract:\s*/i, "");
+  return stripped
+    .split(/\n{2,}/)
+    .map((p) => oneLine(p))
+    .filter(Boolean)
+    .join("\n\n");
 }
 
 function oneLine(s: string): string {
@@ -1162,15 +1223,27 @@ function isoDate(s: string): string {
 // the reader shows. A Kindle has no file to attach to the kept item (the app doesn't upload), so
 // reading it is what "go to the kept item" means here.
 
-async function onRead(card: Card | undefined): Promise<void> {
+async function onRead(card: Card | undefined, allowSave = false): Promise<void> {
   if (!card) return;
+  readingCardId = allowSave ? card.id : null;
   try {
-    await zk.reader.open(await readable(card));
+    const doc = await readable(card);
+    await zk.reader.open(allowSave ? { ...doc, save: "prompt" } : doc);
   } catch (e) {
+    readingCardId = null;
     const why = e instanceof Error ? e.message : String(e);
     if (why !== "Cancelled") message = `Couldn't open “${short(card.title)}”: ${why}`;
     keptCard = null;
   }
+}
+
+function formatPreviewAnnotations(annotations: zk.reader.PreviewAnnotation[]): string {
+  const blocks = annotations.map((a) => {
+    const loc = a.pageLabel ? ` (${escapeHtml(a.pageLabel)})` : "";
+    const quote = `<blockquote><p>${escapeHtml(a.text)}${loc}</p></blockquote>`;
+    return a.comment ? `${quote}<p>${escapeHtml(a.comment)}</p>` : quote;
+  });
+  return `<h3>Highlights from Preview</h3>\n${blocks.join("\n")}`;
 }
 
 type Readable = { url: string; title?: string } | { html: string; title: string; baseUrl?: string };
